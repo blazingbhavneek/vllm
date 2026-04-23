@@ -289,12 +289,18 @@ class LoRAModelManager:
         for module_name, module in self.modules.items():
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
             if not module_lora:
+                base_layer = getattr(module, "base_layer", None)
+                base_layer_prefix = getattr(base_layer, "prefix", None)
+                if base_layer_prefix and base_layer_prefix != module_name:
+                    module_lora = self._get_lora_layer_weights(
+                        lora_model, base_layer_prefix
+                    )
+            if not module_lora:
                 module.reset_lora(index)
                 logger.debug(
                     "No LoRA weights found for module %s, skipping.", module_name
                 )
                 continue
-
             module.set_lora(
                 index,
                 module_lora.lora_a,
