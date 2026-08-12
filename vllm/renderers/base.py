@@ -940,6 +940,9 @@ class BaseRenderer(ABC, Generic[_T]):
             encoder_input=encoder_input,
             decoder_input=decoder_input,
             decoder_start_token_id=self.get_dec_start_token_id(),
+            skip_decoder_start_token=getattr(
+                self.mm_processor, "skip_decoder_start_token", False
+            ),
         )
 
     def process_for_engine(

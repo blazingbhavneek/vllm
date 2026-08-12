@@ -679,9 +679,24 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
 | `Qwen3OmniMoeThinkerForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, etc. | | ✅︎ |
 | `VoxtralForConditionalGeneration` | Voxtral (Mistral format) | `mistralai/Voxtral-Mini-3B-2507`, `mistralai/Voxtral-Small-24B-2507`, etc. | ✅︎ | ✅︎ |
 | `WhisperForConditionalGeneration` | Whisper | `openai/whisper-small`, `openai/whisper-large-v3-turbo`, etc. | | |
+| `WhisperForConditionalGenerationWithAttentionLoss` | CrisperWhisper 2.0 | `nyralabs/CrisperWhisper2.0_large`, `nyralabs/CrisperWhisper2.0_turbo`, etc. | | |
 
 !!! note
     `VoxtralForConditionalGeneration` requires `mistral-common[audio]` to be installed.
+
+!!! note
+    `WhisperForConditionalGenerationWithAttentionLoss` (CrisperWhisper 2.0) transcribes
+    verbatim (disfluencies, filler words) by default; pass
+    `extra_body={"vllm_xargs": '{"crisper_mode": "intended"}'}` for a cleaned-up
+    transcript. `prompt` supplies continuation context and `hotwords` supplies hotwords —
+    the latter is trained into the `*_pro` checkpoints only and may degrade standard
+    checkpoints. Translation, `verbose_json` and segment timestamps are unsupported: word
+    timing comes from cross-attention DTW, which vLLM does not expose. Audio over 30s uses
+    vLLM's generic energy-split chunker rather than CrisperWhisper's sequential
+    conditional-continuation, so chunk seams may show duplicated or dropped words.
+    CrisperWhisper **v1** (`nyrahealth/CrisperWhisper`) is a plain Whisper checkpoint and
+    already works via `WhisperForConditionalGeneration`. Weights are under a non-commercial
+    research license (Pro checkpoints: commercial license available).
 
 #### Realtime Transcription
 

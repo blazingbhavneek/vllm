@@ -607,6 +607,10 @@ _MULTIMODAL_MODELS = {
         "NemotronParseForConditionalGeneration",
     ),
     "WhisperForConditionalGeneration": ("whisper", "WhisperForConditionalGeneration"),
+    "WhisperForConditionalGenerationWithAttentionLoss": (
+        "crisperwhisper",
+        "CrisperWhisperForConditionalGeneration",
+    ),
 }
 
 _SPECULATIVE_DECODING_MODELS = {
