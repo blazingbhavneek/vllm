@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.config.utils import config
 
@@ -49,6 +49,9 @@ class SpeechToTextParams:
 
     to_language: str | None = None
     """Target language for translation (model-dependent)."""
+
+    extra_args: dict[str, Any] | None = None
+    """Model-specific request parameters, from ``vllm_xargs``."""
 
 
 @config
