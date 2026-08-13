@@ -322,6 +322,60 @@ class AudioResampler:
 # ============================================================
 
 
+def chunk_audio_with_stride(
+    audio_data: np.ndarray,
+    sample_rate: int,
+    chunk_duration_s: float,
+    stride_s: float,
+) -> list[np.ndarray]:
+    """Slice audio into fixed-length windows overlapping by chunk - stride.
+
+    Unlike `split_audio`, boundaries are fixed rather than snapped to
+    low-energy points, and consecutive windows overlap. Models whose
+    chunk-to-chunk context describes audio the next window re-hears need this.
+
+    Args:
+        audio_data: 1D mono audio array to split.
+        sample_rate: Sample rate of the audio in Hz.
+        chunk_duration_s: Window length in seconds.
+        stride_s: How far the window advances between chunks, in
+            `(0, chunk_duration_s]`.
+
+    Returns:
+        List of 1D audio chunks.
+
+    Raises:
+        ValueError: If `audio_data` is not 1D, or `stride_s` is out of range.
+    """
+    if audio_data.ndim > 1:
+        raise ValueError(
+            f"chunk_audio_with_stride expects mono audio, got {audio_data.shape}"
+        )
+    if not 0 < stride_s <= chunk_duration_s:
+        raise ValueError(
+            "stride_s must be in (0, chunk_duration_s]; got "
+            f"stride_s={stride_s}, chunk_duration_s={chunk_duration_s}"
+        )
+
+    chunk_size = int(sample_rate * chunk_duration_s)
+    stride_size = int(sample_rate * stride_s)
+    total = audio_data.shape[-1]
+
+    if total <= chunk_size:
+        return [audio_data]
+
+    chunks = []
+    start = 0
+    while start < total:
+        end = min(start + chunk_size, total)
+        chunks.append(audio_data[..., start:end])
+        if end >= total:
+            break
+        start += stride_size
+
+    return chunks
+
+
 def split_audio(
     audio_data: np.ndarray,
     sample_rate: int,

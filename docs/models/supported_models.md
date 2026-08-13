@@ -706,12 +706,20 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
     transcript. `prompt` supplies continuation context and `hotwords` supplies hotwords —
     the latter is trained into the `*_pro` checkpoints only and may degrade standard
     checkpoints. Translation, `verbose_json` and segment timestamps are unsupported: word
-    timing comes from cross-attention DTW, which vLLM does not expose. Audio over 30s uses
-    vLLM's generic energy-split chunker rather than CrisperWhisper's sequential
-    conditional-continuation, so chunk seams may show duplicated or dropped words.
-    CrisperWhisper **v1** (`nyrahealth/CrisperWhisper`) is a plain Whisper checkpoint and
-    already works via `WhisperForConditionalGeneration`. Weights are under a non-commercial
-    research license (Pro checkpoints: commercial license available).
+    timing comes from cross-attention DTW, which vLLM does not expose. The checkpoint's
+    `suppress_tokens` list is applied on every decoding step, matching Hugging Face; start
+    the server with `--generation-config vllm` to opt out. CrisperWhisper **v1**
+    (`nyrahealth/CrisperWhisper`) is a plain Whisper checkpoint and already works via
+    `WhisperForConditionalGeneration`. Weights are under a non-commercial research license
+    (Pro checkpoints: commercial license available).
+
+!!! note
+    Audio longer than 30s is chunked. `WhisperForConditionalGenerationWithAttentionLoss`
+    defaults to `transcribe_mode="accurate"`: overlapping 30s windows decoded one after
+    another, each conditioned on the last words confirmed so far, as in the reference
+    implementation. Pass `extra_body={"vllm_xargs": '{"transcribe_mode": "fast"}'}` for the
+    generic path other ASR models use — disjoint windows decoded concurrently, which is
+    faster but cannot condition across a seam. Other models only support `"fast"`.
 
 #### Realtime Transcription
 

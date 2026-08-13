@@ -148,6 +148,10 @@ class _StubTranscriptionModel:
         )
 
     @classmethod
+    def get_suppress_token_ids(cls, model_config: ModelConfig) -> list[int] | None:
+        return None
+
+    @classmethod
     def post_process_output(cls, text: str) -> str:
         return text
 
