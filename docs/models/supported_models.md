@@ -699,6 +699,16 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
     (Pro checkpoints: commercial license available).
 
 !!! note
+    ASR models can loop on degenerate audio, repeating a word or phrase until the token
+    budget runs out. CrisperWhisper's reference implementation repairs this by banning the
+    token that would start one repeat too many; the same is available in vLLM by starting
+    the server with
+    `--logits-processors vllm.v1.sample.logits_processor.consecutive_ngram:ConsecutiveNgramBlockingLogitsProcessor`
+    and passing `extra_body={"vllm_xargs": '{"consecutive_ngram_block_reps": [8, 8, 3, 3, 3]}'}`.
+    The i-th entry caps consecutive repeats of `(i + 1)`-grams; `0` disables that size.
+    Loading any custom logits processor currently forces the V1 model runner.
+
+!!! note
     Audio longer than 30s is chunked. `WhisperForConditionalGenerationWithAttentionLoss`
     defaults to `transcribe_mode="accurate"`: overlapping 30s windows decoded one after
     another, each conditioned on the last words confirmed so far, as in the reference
