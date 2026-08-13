@@ -56,6 +56,7 @@ from ..transcription.protocol import (
     TranscriptionResponseVerbose,
     TranscriptionSegment,
     TranscriptionStreamResponse,
+    TranscriptionWord,
 )
 from ..translation.protocol import (
     TranslationResponse,
@@ -158,6 +159,32 @@ def _truncate_outputs_to_words(
         remaining = 0
 
 
+def _merge_chunk_word_timings(
+    chunk_word_timings: dict[int, list[dict[str, Any]]] | None,
+    chunk_start_offsets: list[float],
+) -> list[TranscriptionWord] | None:
+    """Shift each chunk's window-local word timings onto the whole audio.
+
+    Chunks are timed independently against their own window, so each one's
+    seconds are relative to where that window starts.
+    """
+    if not chunk_word_timings:
+        return None
+
+    words: list[TranscriptionWord] = []
+    for idx in sorted(chunk_word_timings):
+        offset = chunk_start_offsets[idx] if idx < len(chunk_start_offsets) else 0.0
+        for word in chunk_word_timings[idx]:
+            words.append(
+                TranscriptionWord(
+                    word=word["word"],
+                    start=word["start"] + offset,
+                    end=word["end"] + offset,
+                )
+            )
+    return words or None
+
+
 def asr_inter_chunk_separator(
     language: str | None, no_space_languages: Set[str]
 ) -> str:
@@ -208,7 +235,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         self.max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
         self.max_audio_decode_duration_s: int = envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
         self.max_audio_decode_bytes: int = envs.VLLM_MAX_AUDIO_DECODE_BYTES
-        if self.model_cls.supports_segment_timestamp:
+        # Duck-typed model stubs may predate this attribute, so it is read
+        # defensively, as supports_explicit_language_detection already is.
+        self.supports_word_timings = getattr(
+            self.model_cls, "supports_word_timings", False
+        )
+        if self.model_cls.supports_segment_timestamp or self.supports_word_timings:
+            # Word timing groups tokens into words before asking the workers
+            # to place them, and only this side has a tokenizer.
             self.tokenizer = cast(
                 PreTrainedTokenizerBase,
                 get_tokenizer(
@@ -492,6 +526,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         lora_request: LoRARequest | None,
         trace_headers: Mapping[str, str] | None,
         contexts: list[asyncio.Future[str]],
+        word_timings: dict[int, list[dict[str, Any]]] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Decode one chunk, then pass its transcript on to the next one.
 
@@ -580,8 +615,85 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 len(kept.split()),
             )
 
+        if word_timings is not None and kept:
+            word_timings[idx] = await self._time_chunk_words(
+                request,
+                chunk,
+                previous_text,
+                kept,
+                f"{request_id}-{idx}-align",
+                lora_request,
+                trace_headers,
+            )
+
         for output in outputs:
             yield output
+
+    async def _time_chunk_words(
+        self,
+        request: SpeechToTextRequest,
+        chunk: np.ndarray,
+        previous_text: str,
+        text: str,
+        request_id: str,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+    ) -> list[dict[str, Any]]:
+        """Time the words of one chunk with a second, teacher-forced pass.
+
+        Decoding the accepted transcript scores every one of its tokens against
+        the audio in a single step. The model keeps the result where it was
+        produced and is asked for the finished spans over `collective_rpc`, so
+        nothing here has to cross the engine's output path. Timings are
+        best-effort: any failure yields no words rather than a failed request.
+        """
+        try:
+            _, stt_params = self._build_chunk_prompt(request, chunk, previous_text)
+            prompt = self.model_cls.get_alignment_prompt(stt_params, text)
+            if prompt is None:
+                return []
+
+            parsed = parse_model_prompt(self.model_config, prompt)
+            (engine_input,) = await self.renderer.render_cmpl_async([parsed])
+            if engine_input.get("type") != "enc_dec":
+                return []
+            engine_input = cast(EncoderDecoderInput, engine_input)
+            token_ids = list(engine_input["decoder_prompt"]["prompt_token_ids"])
+
+            params = SamplingParams(max_tokens=1, temperature=0.0)
+            async for _ in self.engine_client.generate(
+                engine_input, params, request_id, lora_request=lora_request,
+                trace_headers=trace_headers,
+            ):
+                pass
+
+            return await self._fetch_word_timings(token_ids)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Word timing failed for %s", request_id, exc_info=True)
+            return []
+
+    async def _fetch_word_timings(
+        self, token_ids: list[int]
+    ) -> list[dict[str, Any]]:
+        """Ask the workers to align the pass they just captured."""
+        pieces = [self.tokenizer.decode([token]) for token in token_ids]
+        plan = self.model_cls.build_word_timing_rpc(token_ids, pieces)
+        if plan is None:
+            return []
+
+        worker_fn, args, words = plan
+        results = await self.engine_client.collective_rpc(worker_fn, args=args)
+        spans = next((result for result in results if result), None)
+        if not spans:
+            return []
+
+        return [
+            {"word": word, "start": float(start), "end": float(end)}
+            for word, (start, end) in zip(words, spans)
+            if start is not None and end is not None
+        ]
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -766,6 +878,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         chunks: list[np.ndarray] = []
         engine_inputs: list[EngineInput] = []
+        # Only the sequential path times words; it is where a chunk's
+        # accepted transcript is known before the response is built.
+        chunk_word_timings: dict[int, list[dict[str, Any]]] | None = None
         if sequential:
             # Prompts depend on the preceding chunk's transcript, so they are
             # built one at a time as generation progresses.
@@ -843,6 +958,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             contexts = [
                 asyncio.get_running_loop().create_future() for _ in range(len(chunks))
             ]
+            # Filled in by each chunk once its transcript is accepted.
+            if self.supports_word_timings:
+                chunk_word_timings = {}
             list_result_generator = [
                 self._generate_chunk_sequentially(
                     idx,
@@ -853,6 +971,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     lora_request,
                     trace_headers,
                     contexts,
+                    chunk_word_timings,
                 )
                 for idx, chunk in enumerate(chunks)
             ]
@@ -994,7 +1113,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     )
                 elif request.response_format != "verbose_json":
                     final_response = cast(
-                        T, TranscriptionResponse(text=text, usage=usage)
+                        T,
+                        TranscriptionResponse(
+                            text=text,
+                            usage=usage,
+                            words=_merge_chunk_word_timings(
+                                chunk_word_timings, chunk_start_offsets
+                            ),
+                        ),
                     )
                 else:
                     final_response = cast(

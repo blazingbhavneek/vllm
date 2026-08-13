@@ -1257,6 +1257,14 @@ class SupportsTranscription(Protocol):
     below :attr:`SpeechToTextConfig.max_audio_clip_s` to overlap the windows.
     """
 
+    supports_word_timings: ClassVar[bool] = False
+    """
+    The model can time individual words, given one extra pass over an
+    already-decoded transcript. Models that set this must implement
+    :meth:`get_alignment_prompt`, and must expose the timings to the serving
+    layer themselves; the engine output structures carry nothing for them.
+    """
+
     supports_explicit_language_detection: ClassVar[bool] = False
     """
     Transcription models that require an explicit language detection step
@@ -1357,6 +1365,33 @@ class SupportsTranscription(Protocol):
         Only called when ``supports_sequential_chunking`` is ``True``, which
         implies an override; the result is passed back as
         :attr:`SpeechToTextParams.previous_text`.
+        """
+        return None
+
+    @classmethod
+    def get_alignment_prompt(
+        cls, stt_params: "SpeechToTextParams", text: str
+    ) -> "PromptType | None":
+        """Prompt that re-scores `text` against the audio in a single pass.
+
+        Only called when ``supports_word_timings`` is ``True``, which implies
+        an override. Returning ``None`` skips timing for this chunk.
+        """
+        return None
+
+    @classmethod
+    def build_word_timing_rpc(
+        cls,
+        token_ids: list[int],
+        token_pieces: list[str],
+    ) -> tuple[Callable[..., Any], tuple, list[str]] | None:
+        """How to collect word timings from the workers, and for which words.
+
+        Returns ``(worker_fn, args, word_texts)``, where ``worker_fn`` is
+        handed to :meth:`EngineClient.collective_rpc` and must return one
+        ``(start, end)`` per entry of ``word_texts``. Keeping the call here
+        means no engine output structure has to carry timings. ``None``
+        disables timing.
         """
         return None
 

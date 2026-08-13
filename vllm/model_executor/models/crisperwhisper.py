@@ -31,7 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backend import AttentionType
 
-from .crisperwhisper_timing import align_word_groups
+from .crisperwhisper_timing import align_word_groups, group_tokens_into_words
 from .interfaces import StreamingTranscriptionPostProcessor
 from .utils import AutoWeightsLoader, extract_layer_index, make_layers, maybe_prefix
 from .whisper import (
@@ -608,6 +608,9 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
     # crisperwhisper/longform/base.py.
     supports_sequential_chunking = True
     sequential_stride_s = LONGFORM_STRIDE_S
+    # Word timings are recovered by a second, teacher-forced pass; see
+    # get_alignment_prompt and fetch_word_timings.
+    supports_word_timings = True
 
     @classmethod
     def _mode_tags(cls, mode: str) -> str:
@@ -660,6 +663,40 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
                 },
             ),
             decoder_prompt=TextPrompt(prompt=decoder_text),
+        )
+
+    @classmethod
+    def get_alignment_prompt(
+        cls, stt_params: SpeechToTextParams, text: str
+    ) -> PromptType:
+        """The same prompt, with an already-decoded transcript appended.
+
+        Decoding this scores every transcript token against the encoder in one
+        pass, which is what the word timings are read from.
+        """
+        prompt = cls.get_generation_prompt(stt_params)
+        return ExplicitEncoderDecoderPrompt(
+            encoder_prompt=prompt["encoder_prompt"],
+            decoder_prompt=TextPrompt(
+                prompt=prompt["decoder_prompt"]["prompt"] + text
+            ),
+        )
+
+    @classmethod
+    def build_word_timing_rpc(
+        cls,
+        token_ids: list[int],
+        token_pieces: list[str],
+    ) -> tuple[Any, tuple, list[str]] | None:
+        word_token_indices, word_texts = group_tokens_into_words(
+            token_ids, token_pieces
+        )
+        if not word_token_indices:
+            return None
+        return (
+            fetch_word_timings,
+            (capture_key(token_ids), word_token_indices, token_ids),
+            word_texts,
         )
 
     @classmethod

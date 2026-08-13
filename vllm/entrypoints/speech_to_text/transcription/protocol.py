@@ -330,6 +330,13 @@ class TranscriptionResponse(OpenAIBaseModel):
     """The transcribed text."""
     usage: TranscriptionUsageAudio
 
+    words: list["TranscriptionWord"] | None = None
+    """Per-word timings, when the model can produce them.
+
+    ``None`` for models that cannot, so clients that do not want timings can
+    ignore the field.
+    """
+
 
 class TranscriptionWord(OpenAIBaseModel):
     end: float
