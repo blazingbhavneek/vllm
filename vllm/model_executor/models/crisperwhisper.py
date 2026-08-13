@@ -7,11 +7,13 @@ carries mode-control tags before ``<|startoftranscript|>``, and in one unused
 training-time head in the checkpoint.
 """
 
+import hashlib
 import math
 import re
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -21,12 +23,15 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
+from vllm.forward_context import get_forward_context
 from vllm.inputs import ExplicitEncoderDecoderPrompt, PromptType, TextPrompt
+from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backend import AttentionType
 
+from .crisperwhisper_timing import align_word_groups
 from .interfaces import StreamingTranscriptionPostProcessor
 from .utils import AutoWeightsLoader, extract_layer_index, make_layers, maybe_prefix
 from .whisper import (
@@ -43,6 +48,8 @@ from .whisper import (
     WhisperProcessingInfo,
     _create_fake_bias_for_k_proj,
 )
+
+logger = init_logger(__name__)
 
 MODE_TAG_COUNT = 5
 VALID_MODES = ("verbatim", "intended")
@@ -69,6 +76,9 @@ LONGFORM_CONTEXT_CHARS = 40
 # cross-attention DTW, which vLLM cannot expose, so this is the reference's
 # timestamp_aware_drop=False path: a fixed drop at every non-final boundary.
 LONGFORM_DROP_WORDS = 2
+
+# Captured passes retained per model, awaiting their alignment call.
+CAPTURE_MAX_ENTRIES = 64
 
 _PROMPT_ARTIFACT_RE = re.compile(
     r"\[verbatim_\d+\]|\[intended_\d+\]"
@@ -198,23 +208,75 @@ def cross_attention_probs(
     return torch.softmax(scores, dim=-1)
 
 
-class CrossAttentionCapture:
-    """Collects alignment-head cross-attention across the decoder stack.
+@dataclass(frozen=True)
+class RequestSlice:
+    """Where one request's rows sit inside a batched forward.
 
-    One instance per capture pass. Layers append to it as they run; `averaged`
-    then gives the `[num_tokens, num_frames]` matrix a DTW consumes.
+    `query` indexes decoder tokens, `key` indexes encoder frames. Both are
+    half-open.
     """
 
-    def __init__(self, alignment_heads: Sequence[tuple[int, int]]) -> None:
+    key_id: str
+    query: tuple[int, int]
+    frames: tuple[int, int]
+
+
+class CrossAttentionCapture:
+    """Collects alignment-head cross-attention, per request in the batch.
+
+    A batched forward concatenates every request's decoder tokens along the
+    query axis and every *new* encoder window along the key axis, so scoring
+    the whole thing at once would mix requests together. The decoder sets the
+    per-request slices before running its layers, and each layer then scores
+    only within them.
+    """
+
+    def __init__(
+        self,
+        alignment_heads: Sequence[tuple[int, int]],
+        max_entries: int = CAPTURE_MAX_ENTRIES,
+    ) -> None:
         if not alignment_heads:
             raise ValueError("alignment_heads must not be empty")
         self.heads_by_layer: dict[int, list[int]] = defaultdict(list)
         for layer_index, head_index in alignment_heads:
             self.heads_by_layer[int(layer_index)].append(int(head_index))
-        self._captured: list[torch.Tensor] = []
+        self.max_entries = max_entries
+        self._slices: list[RequestSlice] = []
+        self._pending_mels: list[np.ndarray] = []
+        self._captured: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._mels: OrderedDict[str, np.ndarray] = OrderedDict()
 
     def wants(self, layer_index: int) -> bool:
         return layer_index in self.heads_by_layer
+
+    def offer_mels(self, mels: Sequence[np.ndarray]) -> None:
+        """Hand over this step's log-mels, in encoder batch order.
+
+        The blank probabilities are read off the mel, and this model's
+        tokenizer has no explicit space token to derive them from instead.
+        """
+        self._pending_mels = list(mels)
+
+    def begin(self, slices: Sequence[RequestSlice]) -> None:
+        """Declare the batch layout for the forward that is about to run."""
+        self._slices = list(slices)
+        # Encoder outputs arrive in the same order as the requests that
+        # brought them, which is the order `batch_request_slices` walks.
+        for request, mel in zip(self._slices, self._pending_mels):
+            self._mels[request.key_id] = mel
+        self._pending_mels = []
+        self._evict()
+
+    def mel_for(self, key_id: str) -> np.ndarray | None:
+        return self._mels.get(key_id)
+
+    def _evict(self) -> None:
+        while len(self._mels) > self.max_entries:
+            stale, _ = self._mels.popitem(last=False)
+            self._captured.pop(stale, None)
+        while len(self._captured) > self.max_entries:
+            self._captured.pop(next(iter(self._captured)))
 
     def capture(
         self,
@@ -223,18 +285,112 @@ class CrossAttentionCapture:
         key: torch.Tensor,
         scale: float,
     ) -> None:
-        self._captured.append(
-            cross_attention_probs(query, key, scale, self.heads_by_layer[layer_index])
-        )
+        heads = self.heads_by_layer[layer_index]
+        for request in self._slices:
+            q0, q1 = request.query
+            k0, k1 = request.frames
+            if q1 > query.shape[0] or k1 > key.shape[0] or q0 >= q1 or k0 >= k1:
+                # Layout did not match the tensors; better no timings than
+                # timings built from another request's frames.
+                continue
+            self._captured[request.key_id].append(
+                cross_attention_probs(query[q0:q1], key[k0:k1], scale, heads)
+            )
 
-    def averaged(self) -> torch.Tensor | None:
+    def averaged(self, key_id: str) -> torch.Tensor | None:
         """Mean over every captured head, `[num_tokens, num_frames]`."""
-        if not self._captured:
+        captured = self._captured.get(key_id)
+        if not captured:
             return None
-        return torch.cat(self._captured, dim=0).mean(dim=0)
+        return torch.cat(captured, dim=0).mean(dim=0)
+
+    def keys(self) -> list[str]:
+        return list(self._captured)
+
+    def pop(self, key_id: str) -> tuple[torch.Tensor | None, np.ndarray | None]:
+        """Take one pass's attention and mel, freeing them."""
+        attention = self.averaged(key_id)
+        self._captured.pop(key_id, None)
+        return attention, self._mels.pop(key_id, None)
 
     def reset(self) -> None:
+        self._slices = []
+        self._pending_mels = []
         self._captured.clear()
+        self._mels.clear()
+
+
+def fetch_word_timings(
+    worker,
+    key_id: str,
+    word_token_indices: Sequence[Sequence[int]],
+    token_ids: Sequence[int],
+) -> list[tuple[float | None, float | None]] | None:
+    """`collective_rpc` entry point: align one captured pass, in the worker.
+
+    Passed as the callable form of `EngineClient.collective_rpc`, so no engine
+    output structure has to carry this and no other model's path is touched.
+    Only the spans cross back, never the attention matrix.
+    """
+    model = getattr(getattr(worker, "model_runner", None), "model", None)
+    if not isinstance(model, CrisperWhisperForConditionalGeneration):
+        return None
+    return model.word_timings(key_id, word_token_indices, token_ids)
+
+
+def capture_key(token_ids: Sequence[int]) -> str:
+    """Stable id for a capture pass, derived from its decoder tokens.
+
+    The engine gives the model no request id, so callers name a pass by what
+    they fed it. Identical token sequences yield identical timings, so a
+    collision is harmless.
+    """
+    digest = hashlib.blake2b(
+        np.asarray(token_ids, dtype=np.int64).tobytes(), digest_size=16
+    )
+    return digest.hexdigest()
+
+
+def batch_request_slices(
+    input_ids: torch.Tensor,
+    query_start_loc: np.ndarray,
+    encoder_seq_lens: np.ndarray,
+) -> list[RequestSlice]:
+    """Map each encoder-bearing request onto its rows of a batched forward.
+
+    Requests whose encoder KV is already cached contribute no keys this step
+    and are reported as zero-length by the cross-attention metadata builder,
+    so only the non-zero entries take frames, in order.
+
+    Args:
+        input_ids: Flattened decoder tokens for the whole batch.
+        query_start_loc: Per-request query offsets, `num_reqs + 1` entries.
+        encoder_seq_lens: Encoder frames contributed per request.
+
+    Returns:
+        One `RequestSlice` per request that brought an encoder window.
+    """
+    slices: list[RequestSlice] = []
+    frame_offset = 0
+    num_reqs = min(len(query_start_loc) - 1, len(encoder_seq_lens))
+
+    for request in range(num_reqs):
+        num_frames = int(encoder_seq_lens[request])
+        if num_frames <= 0:
+            continue
+        q0 = int(query_start_loc[request])
+        q1 = int(query_start_loc[request + 1])
+        if q1 > q0:
+            slices.append(
+                RequestSlice(
+                    key_id=capture_key(input_ids[q0:q1].tolist()),
+                    query=(q0, q1),
+                    frames=(frame_offset, frame_offset + num_frames),
+                )
+            )
+        frame_offset += num_frames
+
+    return slices
 
 
 class CrisperWhisperCrossAttention(WhisperCrossAttention):
@@ -366,6 +522,9 @@ class CrisperWhisperDecoder(nn.Module):
         positions = self.embed_positions(positions)
         hidden_states = inputs_embeds + positions
 
+        if encoder_hidden_states is not None:
+            self._begin_capture(input_ids)
+
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
@@ -374,6 +533,37 @@ class CrisperWhisperDecoder(nn.Module):
 
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
+
+    def _begin_capture(self, input_ids: torch.Tensor) -> None:
+        """Tell an active capture how this batch is laid out.
+
+        Only runs on encoder-bearing passes, which vLLM already executes
+        eagerly for encoder-decoder models, so reading the forward context
+        here cannot break a compiled or graph-captured region.
+        """
+        capture = self.layers[0].encoder_attn.alignment_capture
+        if capture is None:
+            return
+
+        capture.begin([])
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            metadata = metadata.get(self.layers[0].encoder_attn.attn.layer_name)
+        if metadata is None:
+            return
+
+        query_start_loc = getattr(metadata, "query_start_loc_cpu", None)
+        encoder_seq_lens = getattr(metadata, "encoder_seq_lens_cpu", None)
+        if query_start_loc is None or encoder_seq_lens is None:
+            return
+
+        capture.begin(
+            batch_request_slices(
+                input_ids,
+                np.asarray(query_start_loc),
+                np.asarray(encoder_seq_lens),
+            )
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -599,23 +789,73 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config.vocab_size, scale=logit_scale)
 
+        # Armed for the life of the model when the checkpoint nominates
+        # alignment heads: scoring ten heads costs well under a MFLOP per
+        # encoder-bearing pass, so gating it per request would cost more in
+        # plumbing than it saves.
+        self._alignment_capture: CrossAttentionCapture | None = None
+        alignment_heads = self.get_alignment_heads(vllm_config.model_config)
+        if alignment_heads:
+            self._set_capture(CrossAttentionCapture(alignment_heads))
+        else:
+            logger.info(
+                "%s ships no alignment_heads; word timings unavailable.",
+                vllm_config.model_config.model,
+            )
+
     @contextmanager
     def capture_cross_attention(self, alignment_heads: Sequence[tuple[int, int]]):
-        """Score the alignment heads for the duration of one forward pass.
-
-        Only passes that carry encoder states are scored, so this is meant to
-        wrap a single teacher-forced forward over an already-decoded
-        transcript, not a decode loop.
-        """
+        """Score a different head set for the duration of one pass."""
+        previous = self._alignment_capture
         capture = CrossAttentionCapture(alignment_heads)
-        cross_attns = [layer.encoder_attn for layer in self.model.decoder.layers]
-        for cross_attn in cross_attns:
-            cross_attn.alignment_capture = capture
+        self._set_capture(capture)
         try:
             yield capture
         finally:
-            for cross_attn in cross_attns:
-                cross_attn.alignment_capture = None
+            self._set_capture(previous)
+
+    def _set_capture(self, capture: CrossAttentionCapture | None) -> None:
+        self._alignment_capture = capture
+        for layer in self.model.decoder.layers:
+            layer.encoder_attn.alignment_capture = capture
+
+    def embed_multimodal(self, **kwargs: object):
+        audio_input = self._parse_and_validate_audio_input(**kwargs)
+        features = audio_input["input_features"]
+        enc_output = self.model.get_encoder_outputs(features)
+
+        if self._alignment_capture is not None and features is not None:
+            self._alignment_capture.offer_mels(
+                [np.asarray(mel.detach().float().cpu()) for mel in features]
+            )
+
+        return enc_output.unbind(dim=0)
+
+    def word_timings(
+        self,
+        key_id: str,
+        word_token_indices: Sequence[Sequence[int]],
+        token_ids: Sequence[int],
+    ) -> list[tuple[float | None, float | None]] | None:
+        """Align a pass's captured attention to a caller-supplied grouping.
+
+        Runs where the attention and the mel already are, so only the spans
+        travel back. Returns `None` when nothing was captured under `key_id`,
+        which is not an error: timings are best-effort.
+        """
+        if self._alignment_capture is None:
+            return None
+
+        attention, mel = self._alignment_capture.pop(key_id)
+        if attention is None or mel is None:
+            return None
+
+        return align_word_groups(
+            token_ids,
+            word_token_indices,
+            np.asarray(attention.cpu()),
+            mel,
+        )
 
     @classmethod
     def get_alignment_heads(
