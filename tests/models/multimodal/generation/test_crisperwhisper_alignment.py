@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Alignment-head cross-attention capture, on CPU.
+"""Alignment-head cross-attention capture for CrisperWhisper, on CPU.
 
-Only the scoring and collection are covered here; wiring the layer into a
-backend needs a GPU and is exercised by the model tests.
+Covers the scoring and collection. Wiring the decoder stack to a backend
+needs a GPU and is exercised by the model tests.
 """
 
 import pytest
 import torch
 
-from vllm.model_executor.layers.attention.aligned_cross_attention import (
+from vllm.model_executor.models.crisperwhisper import (
+    CrisperWhisperCrossAttention,
+    CrisperWhisperDecoder,
+    CrisperWhisperDecoderLayer,
     CrossAttentionCapture,
     cross_attention_probs,
+)
+from vllm.model_executor.models.whisper import (
+    WhisperCrossAttention,
+    WhisperDecoderLayer,
 )
 
 NUM_TOKENS = 7
@@ -109,3 +116,26 @@ def test_capture_is_empty_until_a_layer_runs():
 def test_capture_requires_alignment_heads():
     with pytest.raises(ValueError):
         CrossAttentionCapture([])
+
+
+def test_decoder_stack_subclasses_whisper_without_touching_it():
+    """The capture path must be additive, not a fork of the Whisper stack."""
+    assert issubclass(CrisperWhisperCrossAttention, WhisperCrossAttention)
+    assert issubclass(CrisperWhisperDecoderLayer, WhisperDecoderLayer)
+    # forward is inherited from Whisper: only __init__ swaps the attention.
+    assert CrisperWhisperDecoderLayer.forward is WhisperDecoderLayer.forward
+
+
+def test_decoder_keeps_torch_compile():
+    """Subclassing must not silently drop vLLM's compilation."""
+    bases = [cls.__name__ for cls in CrisperWhisperDecoder.__mro__]
+    assert "TorchCompileWithNoGuardsWrapper" in bases
+
+
+def test_capture_is_off_by_default():
+    """A layer with no capture set must behave exactly like Whisper's."""
+    assert CrisperWhisperCrossAttention.__init__ is not WhisperCrossAttention.__init__
+    # The only per-instance additions are the capture slot and layer index.
+    added = {"alignment_capture", "alignment_layer_index"}
+    source = CrisperWhisperCrossAttention.__init__.__code__.co_names
+    assert added.issubset(set(source))
