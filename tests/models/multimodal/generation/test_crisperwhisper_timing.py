@@ -12,6 +12,7 @@ import pytest
 
 from vllm.model_executor.models.crisperwhisper_timing import (
     WordTiming,
+    align_word_groups,
     blank_logp_from_mel_energy,
     blank_logp_from_space_attention,
     extract_word_timings,
@@ -180,7 +181,9 @@ def test_keep_unplaceable_stays_one_to_one_with_words():
     ids, pieces = _sequence()
     _, word_texts = group_tokens_into_words(ids, pieces)
 
-    kept = extract_word_timings(ids, pieces, _attention(), _mel(), keep_unplaceable=True)
+    kept = extract_word_timings(
+        ids, pieces, _attention(), _mel(), keep_unplaceable=True
+    )
 
     assert [w.word for w in kept] == word_texts
 
@@ -202,3 +205,30 @@ def test_short_gaps_are_shared_and_real_pauses_are_not():
 
 def test_empty_input_yields_no_words():
     assert extract_word_timings([], [], np.zeros((0, NUM_FRAMES)), _mel()) == []
+
+
+def test_worker_half_matches_the_full_pipeline():
+    """align_word_groups is what runs where the tokenizer is not available."""
+    ids, pieces = _sequence()
+    attention, mel = _attention(), _mel()
+    indices, _ = group_tokens_into_words(ids, pieces)
+
+    spans = align_word_groups(ids, indices, attention, mel)
+    full = extract_word_timings(
+        ids, pieces, attention, mel, split_gap_max_s=0.0, keep_unplaceable=True
+    )
+
+    assert len(spans) == len(full)
+    assert [s for s, _ in spans] == [w.start for w in full]
+    assert [e for _, e in spans] == [w.end for w in full]
+
+
+def test_worker_half_needs_no_token_pieces():
+    """Only ids and the grouping cross into the worker, never decoded text."""
+    ids, pieces = _sequence()
+    indices, _ = group_tokens_into_words(ids, pieces)
+
+    spans = align_word_groups(ids, indices, _attention(), _mel())
+
+    assert len(spans) == len(indices)
+    assert all(isinstance(s, float) and isinstance(e, float) for s, e in spans)

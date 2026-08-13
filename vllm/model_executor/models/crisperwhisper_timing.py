@@ -336,6 +336,81 @@ def split_interword_gaps(
     return words
 
 
+def align_word_groups(
+    token_ids: Sequence[int],
+    word_token_indices: Sequence[Sequence[int]],
+    attention: np.ndarray,
+    mel: np.ndarray,
+    *,
+    audio_duration_s: float | None = None,
+    sharpen: float = 5.0,
+    frame_duration: float = FRAME_DURATION_S,
+    blank_source: str = "mel",
+    blank_gamma: float = 3.0,
+    blank_penalty: float = 3.0,
+    clip_to_audio: bool = False,
+) -> list[tuple[float | None, float | None]]:
+    """Align a precomputed word grouping to frames. No tokenizer needed.
+
+    This is the half that has to run where the attention and the mel are, so
+    it deliberately takes the grouping as data. Only `[(start, end), ...]`
+    comes back, one entry per word group, which is what crosses a process
+    boundary rather than the `[num_tokens, num_frames]` matrix.
+
+    Args:
+        token_ids: Generated token ids, 1-to-1 with `attention` rows. Only
+            used to locate space tokens for the `"space"` blank source.
+        word_token_indices: Token positions per word, from
+            `group_tokens_into_words`.
+        attention: Post-softmax cross-attention `[num_tokens, num_frames]`,
+            averaged over the alignment heads.
+        mel: Log-mel of the same window, `[num_mels, num_mel_frames]`.
+        audio_duration_s: Window length; only used with `clip_to_audio`.
+        sharpen: Attention sharpening exponent.
+        frame_duration: Seconds per encoder frame.
+        blank_source: `"mel"`, `"space"`, or `"auto"`.
+        blank_gamma: Blank exponent, see `blank_logp_from_mel_energy`.
+        blank_penalty: Log-prior against blank states.
+        clip_to_audio: Restrict analysis to `audio_duration_s`.
+
+    Returns:
+        `(start, end)` seconds per word group, `(None, None)` if unplaceable.
+    """
+    if not word_token_indices or attention.shape[0] == 0:
+        return []
+
+    total_frames = attention.shape[1]
+    if clip_to_audio and audio_duration_s is not None:
+        frames = min(
+            total_frames, max(1, int(round(audio_duration_s / frame_duration)))
+        )
+        mel_audio_frames: int | None = frames
+    else:
+        frames = total_frames
+        mel_audio_frames = None
+
+    attn = attention[:, :frames].astype(np.float32)
+    token_logp = token_logp_from_attention(attn, sharpen=sharpen)
+
+    blank_logp = None
+    if blank_source in ("auto", "space"):
+        blank_logp = blank_logp_from_space_attention(
+            attn, token_ids, target_frames=frames, sharpen=sharpen
+        )
+    if blank_logp is None:
+        blank_logp = blank_logp_from_mel_energy(
+            mel,
+            target_frames=frames,
+            audio_frames=mel_audio_frames,
+            gamma=blank_gamma,
+            penalty=blank_penalty,
+        )
+
+    return viterbi_align_words_with_blanks(
+        token_logp, blank_logp, word_token_indices, frame_duration=frame_duration
+    )
+
+
 def extract_word_timings(
     token_ids: Sequence[int],
     token_pieces: Sequence[str],
@@ -389,35 +464,18 @@ def extract_word_timings(
     if not word_token_indices:
         return []
 
-    total_frames = attention.shape[1]
-    if clip_to_audio and audio_duration_s is not None:
-        frames = min(
-            total_frames, max(1, int(round(audio_duration_s / frame_duration)))
-        )
-        mel_audio_frames: int | None = frames
-    else:
-        frames = total_frames
-        mel_audio_frames = None
-
-    attn = attention[:, :frames].astype(np.float32)
-    token_logp = token_logp_from_attention(attn, sharpen=sharpen)
-
-    blank_logp = None
-    if blank_source in ("auto", "space"):
-        blank_logp = blank_logp_from_space_attention(
-            attn, token_ids, target_frames=frames, sharpen=sharpen
-        )
-    if blank_logp is None:
-        blank_logp = blank_logp_from_mel_energy(
-            mel,
-            target_frames=frames,
-            audio_frames=mel_audio_frames,
-            gamma=blank_gamma,
-            penalty=blank_penalty,
-        )
-
-    spans = viterbi_align_words_with_blanks(
-        token_logp, blank_logp, word_token_indices, frame_duration=frame_duration
+    spans = align_word_groups(
+        token_ids,
+        word_token_indices,
+        attention,
+        mel,
+        audio_duration_s=audio_duration_s,
+        sharpen=sharpen,
+        frame_duration=frame_duration,
+        blank_source=blank_source,
+        blank_gamma=blank_gamma,
+        blank_penalty=blank_penalty,
+        clip_to_audio=clip_to_audio,
     )
 
     placed: list[WordTiming] = []
