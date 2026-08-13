@@ -1219,6 +1219,22 @@ class SupportsTranscription(Protocol):
     supports_diarized_transcription: ClassVar[bool] = False
     """Enables the ``diarized_json`` response format for the model."""
 
+    supports_sequential_chunking: ClassVar[bool] = False
+    """
+    The model can transcribe long audio one chunk at a time, conditioning each
+    chunk on the text decoded so far. Models that set this must consume
+    :attr:`SpeechToTextParams.previous_text` in
+    :meth:`get_generation_prompt` and override :meth:`get_chunk_context`.
+    """
+
+    sequential_stride_s: ClassVar[float | None] = None
+    """
+    Window advance, in seconds, when chunking for sequential decoding.
+    ``None`` keeps the default disjoint clips cut at low-energy points. Models
+    whose chunk context describes audio the next window *re-hears* set this
+    below :attr:`SpeechToTextConfig.max_audio_clip_s` to overlap the windows.
+    """
+
     supports_explicit_language_detection: ClassVar[bool] = False
     """
     Transcription models that require an explicit language detection step
@@ -1305,6 +1321,58 @@ class SupportsTranscription(Protocol):
         Map from audio duration to number of audio tokens produced by the ASR
         model, without running a forward pass.
         This is used for estimating the amount of processing for this audio.
+        """
+        return None
+
+    @classmethod
+    def get_chunk_context(
+        cls,
+        previous_text: str,
+        stt_params: "SpeechToTextParams",
+    ) -> str | None:
+        """Trim the transcript so far down to the next chunk's context.
+
+        Only called when ``supports_sequential_chunking`` is ``True``, which
+        implies an override; the result is passed back as
+        :attr:`SpeechToTextParams.previous_text`.
+        """
+        return None
+
+    @classmethod
+    def trim_chunk_boundary(cls, text: str, stt_params: "SpeechToTextParams") -> str:
+        """Drop the trailing words of a non-final sequentially decoded chunk.
+
+        The result is both what the client receives for this chunk and what
+        the next chunk's context is built from, so a model that overlaps its
+        windows can hand the seam to the window that re-hears it.
+        """
+        return text
+
+    @classmethod
+    def should_retry_chunk(
+        cls,
+        text: str,
+        stt_params: "SpeechToTextParams",
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        """Decide whether a sequentially decoded chunk should be redone.
+
+        Greedy decoding occasionally collapses, returning a confident but
+        near-empty transcript for a chunk full of speech. Return sampling
+        overrides (``temperature``, ``top_p``, ``top_k`` or ``seed``) to
+        re-decode with, or ``None`` to accept ``text``. ``attempt`` counts
+        redone decodes, starting at 0.
+        """
+        return None
+
+    @classmethod
+    def get_suppress_token_ids(cls, model_config: "ModelConfig") -> list[int] | None:
+        """Token IDs the model must never emit.
+
+        Checkpoints that ship a ``suppress_tokens`` list expect it to be
+        applied at every decoding step. Returning the IDs here lets the
+        speech-to-text serving layer mask them for both streaming and
+        non-streaming requests. ``None`` disables suppression.
         """
         return None
 

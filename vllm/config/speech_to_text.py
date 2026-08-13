@@ -53,6 +53,13 @@ class SpeechToTextParams:
     extra_args: dict[str, Any] | None = None
     """Model-specific request parameters, from ``vllm_xargs``."""
 
+    previous_text: str | None = None
+    """Text decoded from the preceding chunk, when transcribing sequentially.
+
+    Only set for models that declare ``supports_sequential_chunking``; it is
+    already trimmed by ``get_chunk_context``.
+    """
+
 
 @config
 class SpeechToTextConfig:
@@ -79,6 +86,13 @@ class SpeechToTextConfig:
     audio chunks. The algorithm looks for the quietest moment within this
     window to minimize cutting through speech. Default 1600 samples ≈ 100ms
     at 16kHz. If None, no chunking will be done."""
+
+    sequential_chunking: bool = False
+    """Default to transcribing chunks one after another, conditioning each on
+    the text decoded so far, instead of running them concurrently. Slower, but
+    it avoids duplicated or dropped words at chunk seams. Requires the model to
+    declare `supports_sequential_chunking`; requests can override it with the
+    `transcribe_mode` custom argument."""
 
     @property
     def allow_audio_chunking(self) -> bool:

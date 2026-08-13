@@ -2,19 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import io
+import itertools
 import math
+import re
 import time
 import zlib
-from collections.abc import AsyncGenerator, Callable, Set
+from collections.abc import AsyncGenerator, Callable, Mapping, Set
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
-from typing import Final, Literal, TypeAlias, TypeVar, cast
+from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
 
 import numpy as np
 from fastapi import Request
 from transformers import PreTrainedTokenizerBase
 
 import vllm.envs as envs
+from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.openai.engine.protocol import (
@@ -31,13 +34,18 @@ from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EncoderDecoderInput, EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import FlatLogprobs, Logprob
+from vllm.lora.request import LoRARequest
 from vllm.model_executor.models import SupportsTranscription
-from vllm.multimodal.audio import get_audio_duration, split_audio
+from vllm.multimodal.audio import (
+    chunk_audio_with_stride,
+    get_audio_duration,
+    split_audio,
+)
 from vllm.multimodal.media.audio import load_audio
 from vllm.outputs import RequestOutput
 from vllm.renderers.inputs import DictPrompt, EncoderDecoderDictPrompt
 from vllm.renderers.inputs.preprocess import parse_enc_dec_prompt, parse_model_prompt
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.async_utils import make_async_with_semaphore, merge_async_iterators
 
@@ -78,6 +86,76 @@ ResponseType: TypeAlias = (
 )
 
 logger = init_logger(__name__)
+
+_RETRY_SAMPLING_FIELDS = frozenset({"temperature", "top_p", "top_k", "seed"})
+
+
+def _apply_sampling_overrides(
+    sampling_params: SamplingParams, overrides: dict[str, Any]
+) -> SamplingParams:
+    """Copy `sampling_params` with a model's chunk-retry overrides applied."""
+    if unknown := sorted(set(overrides) - _RETRY_SAMPLING_FIELDS):
+        raise ValueError(
+            f"should_retry_chunk may only override "
+            f"{sorted(_RETRY_SAMPLING_FIELDS)}, got {unknown}"
+        )
+
+    retried = sampling_params.clone()
+    for field, value in overrides.items():
+        setattr(retried, field, value)
+    # `sampling_type` is derived from temperature and seed, and a shallow
+    # clone carries the memoized value over.
+    retried.__dict__.pop("sampling_type", None)
+    return retried
+
+
+def _truncate_outputs_to_words(
+    outputs: list[RequestOutput],
+    sampling_params: SamplingParams,
+    post_process: Callable[[str], str],
+    target_words: int,
+) -> None:
+    """Trim buffered chunk outputs in place to `target_words` words.
+
+    The cut lands on the raw text but is measured on the post-processed text,
+    so markers the model echoed back cannot shift it. Token ids are left
+    alone; they only feed usage accounting.
+    """
+    if not outputs:
+        return
+
+    is_delta = sampling_params.output_kind == RequestOutputKind.DELTA
+    parts = (
+        [output.outputs[0].text for output in outputs]
+        if is_delta
+        else [outputs[-1].outputs[0].text]
+    )
+    full = "".join(parts)
+    if len(post_process(full).split()) <= target_words:
+        return
+
+    # Longest prefix that post-processes to at most `target_words` words.
+    cut = None
+    for match in reversed(list(re.finditer(r"\S+", full))):
+        candidate = full[: match.start()].rstrip()
+        if len(post_process(candidate).split()) <= target_words:
+            cut = len(candidate)
+            break
+    if cut is None:
+        return
+
+    if not is_delta:
+        outputs[-1].outputs[0].text = full[:cut]
+        return
+
+    # Walk the deltas in order, keeping the first `cut` characters overall.
+    remaining = cut
+    for output, part in zip(outputs, parts):
+        if remaining >= len(part):
+            remaining -= len(part)
+            continue
+        output.outputs[0].text = part[:remaining]
+        remaining = 0
 
 
 def asr_inter_chunk_separator(
@@ -120,6 +198,9 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         )
         self.streaming_post_processor_cls = (
             self.model_cls.get_streaming_post_processor_cls()
+        )
+        self.suppress_token_ids = self.model_cls.get_suppress_token_ids(
+            self.model_config
         )
 
         self.enable_force_include_usage = enable_force_include_usage
@@ -168,6 +249,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
     def _decode_and_chunk_speech(
         self,
         audio_data: bytes,
+        stride_s: float | None = None,
     ) -> tuple[list[np.ndarray], float]:
         # Decode audio bytes.  For container formats (MP4, M4A, WebM) that
         # soundfile cannot detect from a BytesIO stream, _load_audio_bytes
@@ -196,6 +278,16 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         if not do_split_audio:
             chunks = [y]
+        elif stride_s is not None:
+            # Continuation-style decoding: windows must overlap, because the
+            # context each one is given describes audio it re-hears.
+            assert self.asr_config.max_audio_clip_s is not None
+            chunks = chunk_audio_with_stride(
+                audio_data=y,
+                sample_rate=int(sr),
+                chunk_duration_s=self.asr_config.max_audio_clip_s,
+                stride_s=stride_s,
+            )
         else:
             assert self.asr_config.max_audio_clip_s is not None
             assert self.asr_config.min_energy_split_window_size is not None
@@ -260,12 +352,37 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         logger.info("Auto-detected language: '%s'", lang)
         return lang
 
-    async def _preprocess_speech_to_text(
+    def _use_sequential_chunking(self, request: SpeechToTextRequest) -> bool:
+        """Whether to decode chunks one at a time, conditioned on the last."""
+        mode = (getattr(request, "vllm_xargs", None) or {}).get("transcribe_mode")
+        if mode is None:
+            requested = self.asr_config.sequential_chunking
+        elif mode in ("fast", "accurate"):
+            requested = mode == "accurate"
+        else:
+            raise VLLMValidationError(
+                "transcribe_mode must be 'fast' or 'accurate'",
+                parameter="transcribe_mode",
+                value=mode,
+            )
+
+        if requested and not self.model_cls.supports_sequential_chunking:
+            raise VLLMValidationError(
+                f"{self.model_config.model} does not support sequential "
+                "chunking; use transcribe_mode='fast'",
+                parameter="transcribe_mode",
+                value=mode,
+            )
+        return requested
+
+    async def _prepare_chunks(
         self,
         request: SpeechToTextRequest,
         audio_data: bytes,
         request_id: str,
-    ) -> tuple[list[EngineInput], float, list[float]]:
+        sequential: bool = False,
+    ) -> tuple[list[np.ndarray], float, list[float]]:
+        """Validate, decode, chunk, and resolve the language of the audio."""
         # Validate request
         request.language = self.model_cls.validate_language(request.language)
         request.to_language = (
@@ -281,15 +398,25 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 value=len(audio_data) / 1024**2,
             )
 
+        stride_s = self.model_cls.sequential_stride_s if sequential else None
+
         # Run cpu intensive preprocess step in a separate thread pool executor.
-        chunks, duration = await self._decode_and_chunk_speech_async(audio_data)
+        chunks, duration = await self._decode_and_chunk_speech_async(
+            audio_data, stride_s
+        )
 
         chunk_start_offsets: list[float] = [0.0]
 
-        for chunk in chunks[:-1]:
-            chunk_start_offsets.append(
-                chunk_start_offsets[-1] + chunk.shape[-1] / self.asr_config.sample_rate
-            )
+        if stride_s is not None:
+            # Windows overlap, so each starts one stride after the previous
+            # one rather than one chunk length after it.
+            chunk_start_offsets = [idx * stride_s for idx in range(len(chunks))]
+        else:
+            for chunk in chunks[:-1]:
+                chunk_start_offsets.append(
+                    chunk_start_offsets[-1]
+                    + chunk.shape[-1] / self.asr_config.sample_rate
+                )
 
         if request.language is None and getattr(
             self.model_cls, "supports_explicit_language_detection", False
@@ -299,28 +426,162 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 chunks[0], f"{request_id}-lang_detect"
             )
 
-        parsed_prompts: list[DictPrompt] = []
-        for chunk in chunks:
-            stt_params = request.build_stt_params(
-                audio=chunk,
-                stt_config=self.asr_config,
-                model_config=self.model_config,
-                task_type=self.task_type,
+        return chunks, duration, chunk_start_offsets
+
+    def _build_chunk_prompt(
+        self,
+        request: SpeechToTextRequest,
+        chunk: np.ndarray,
+        previous_text: str = "",
+    ) -> tuple[DictPrompt, SpeechToTextParams]:
+        stt_params = request.build_stt_params(
+            audio=chunk,
+            stt_config=self.asr_config,
+            model_config=self.model_config,
+            task_type=self.task_type,
+        )
+        if previous_text:
+            stt_params.previous_text = self.model_cls.get_chunk_context(
+                previous_text, stt_params
             )
-            prompt = self.model_cls.get_generation_prompt(stt_params)
 
-            parsed_prompt: DictPrompt
-            if request.response_format == "verbose_json":
-                parsed_prompt = parse_enc_dec_prompt(prompt)
-                parsed_prompt = self._preprocess_verbose_prompt(parsed_prompt)
-            else:
-                parsed_prompt = parse_model_prompt(self.model_config, prompt)
+        prompt = self.model_cls.get_generation_prompt(stt_params)
 
-            parsed_prompts.append(parsed_prompt)
+        parsed_prompt: DictPrompt
+        if request.response_format == "verbose_json":
+            parsed_prompt = parse_enc_dec_prompt(prompt)
+            parsed_prompt = self._preprocess_verbose_prompt(parsed_prompt)
+        else:
+            parsed_prompt = parse_model_prompt(self.model_config, prompt)
 
+        return parsed_prompt, stt_params
+
+    async def _preprocess_speech_to_text(
+        self,
+        request: SpeechToTextRequest,
+        audio_data: bytes,
+        request_id: str,
+    ) -> tuple[list[EngineInput], float, list[float]]:
+        chunks, duration, chunk_start_offsets = await self._prepare_chunks(
+            request, audio_data, request_id
+        )
+        parsed_prompts = [
+            self._build_chunk_prompt(request, chunk)[0] for chunk in chunks
+        ]
         engine_inputs = await self.renderer.render_cmpl_async(parsed_prompts)
 
         return engine_inputs, duration, chunk_start_offsets
+
+    @staticmethod
+    def _collect_chunk_text(
+        outputs: list[RequestOutput], sampling_params: SamplingParams
+    ) -> str:
+        if not outputs:
+            return ""
+        if sampling_params.output_kind == RequestOutputKind.DELTA:
+            return "".join(output.outputs[0].text for output in outputs)
+        return outputs[-1].outputs[0].text
+
+    async def _generate_chunk_sequentially(
+        self,
+        idx: int,
+        chunk: np.ndarray,
+        request: SpeechToTextRequest,
+        request_id: str,
+        sampling_params: SamplingParams,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+        contexts: list[asyncio.Future[str]],
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Decode one chunk, then pass its transcript on to the next one.
+
+        Output is buffered until the chunk is accepted, so a collapsed decode
+        that gets retried is never sent to the client.
+        """
+        previous_text = ""
+        text = ""
+        kept = ""
+        outputs: list[RequestOutput] = []
+        issued_ids: list[str] = []
+        is_last = idx == len(contexts) - 1
+
+        try:
+            if idx:
+                previous_text = await contexts[idx - 1]
+
+            params = sampling_params
+            for attempt in itertools.count():
+                prompt, stt_params = self._build_chunk_prompt(
+                    request, chunk, previous_text
+                )
+                (engine_input,) = await self.renderer.render_cmpl_async([prompt])
+
+                engine_request_id = f"{request_id}-{idx}"
+                if attempt:
+                    engine_request_id = f"{engine_request_id}-retry{attempt}"
+                issued_ids.append(engine_request_id)
+                self._log_inputs(
+                    engine_request_id,
+                    engine_input,
+                    params=params,
+                    lora_request=lora_request,
+                )
+
+                outputs = []
+                async for output in self.engine_client.generate(
+                    engine_input,
+                    params,
+                    engine_request_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                ):
+                    outputs.append(output)
+
+                # Clean the text before it is judged or fed forward: control
+                # markers the model echoes back must not land in the next
+                # chunk's context, nor count towards its word coverage.
+                text = self.model_cls.post_process_output(
+                    self._collect_chunk_text(outputs, params)
+                )
+                overrides = self.model_cls.should_retry_chunk(text, stt_params, attempt)
+                if overrides is None:
+                    # Drop the seam from the client's text and the next
+                    # chunk's context alike, so it is transcribed exactly once.
+                    kept = (
+                        text
+                        if is_last
+                        else self.model_cls.trim_chunk_boundary(text, stt_params)
+                    )
+                    break
+
+                logger.info(
+                    "Chunk %d of %s rejected after attempt %d; retrying with %s",
+                    idx,
+                    request_id,
+                    attempt,
+                    overrides,
+                )
+                params = _apply_sampling_overrides(params, overrides)
+        except asyncio.CancelledError:
+            if issued_ids:
+                await asyncio.gather(
+                    self.engine_client.abort(issued_ids), return_exceptions=True
+                )
+            raise
+        finally:
+            if not contexts[idx].done():
+                contexts[idx].set_result(f"{previous_text} {kept}".strip())
+
+        if kept != text:
+            _truncate_outputs_to_words(
+                outputs,
+                params,
+                self.model_cls.post_process_output,
+                len(kept.split()),
+            )
+
+        for output in outputs:
+            yield output
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -497,15 +758,33 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        (
-            engine_inputs,
-            duration_s,
-            chunk_start_offsets,
-        ) = await self._preprocess_speech_to_text(
-            request=request,
-            audio_data=audio_data,
-            request_id=request_id,
-        )
+        sequential = self._use_sequential_chunking(request)
+        if sequential and request.use_beam_search:
+            return self.create_error_response(
+                "transcribe_mode='accurate' is not supported with beam search"
+            )
+
+        chunks: list[np.ndarray] = []
+        engine_inputs: list[EngineInput] = []
+        if sequential:
+            # Prompts depend on the preceding chunk's transcript, so they are
+            # built one at a time as generation progresses.
+            chunks, duration_s, chunk_start_offsets = await self._prepare_chunks(
+                request=request,
+                audio_data=audio_data,
+                request_id=request_id,
+                sequential=True,
+            )
+        else:
+            (
+                engine_inputs,
+                duration_s,
+                chunk_start_offsets,
+            ) = await self._preprocess_speech_to_text(
+                request=request,
+                audio_data=audio_data,
+                request_id=request_id,
+            )
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
@@ -541,11 +820,47 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1
 
+        if self.suppress_token_ids and isinstance(sampling_params, SamplingParams):
+            # Beam search has no logit_bias equivalent, so suppression only
+            # covers the sampling path.
+            logit_bias = dict(sampling_params.logit_bias or {})
+            logit_bias.update(dict.fromkeys(self.suppress_token_ids, -math.inf))
+            sampling_params.logit_bias = logit_bias
+
+        trace_headers = (
+            None
+            if raw_request is None
+            else await self._get_trace_headers(raw_request.headers)
+        )
+
+        list_result_generator = []
+        if sequential:
+            assert isinstance(sampling_params, SamplingParams)
+            # Each chunk waits on its predecessor's transcript, which
+            # serializes the generators no matter how they are consumed. These
+            # abort their own engine requests, and leave `engine_inputs` empty
+            # so the loop below is a no-op.
+            contexts = [
+                asyncio.get_running_loop().create_future() for _ in range(len(chunks))
+            ]
+            list_result_generator = [
+                self._generate_chunk_sequentially(
+                    idx,
+                    chunk,
+                    request,
+                    request_id,
+                    sampling_params,
+                    lora_request,
+                    trace_headers,
+                    contexts,
+                )
+                for idx, chunk in enumerate(chunks)
+            ]
+
         engine_request_ids = [
             request_id if len(engine_inputs) == 1 else f"{request_id}-{idx}"
             for idx in range(len(engine_inputs))
         ]
-        list_result_generator = []
         try:
             for request_id_item, engine_input in zip(engine_request_ids, engine_inputs):
                 self._log_inputs(
@@ -553,12 +868,6 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     engine_input,
                     params=sampling_params,
                     lora_request=lora_request,
-                )
-
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
                 )
 
                 if isinstance(sampling_params, BeamSearchParams):
