@@ -1398,12 +1398,24 @@ class SupportsTranscription(Protocol):
         return None
 
     @classmethod
-    def trim_chunk_boundary(cls, text: str, stt_params: "SpeechToTextParams") -> str:
+    def trim_chunk_boundary(
+        cls,
+        text: str,
+        stt_params: "SpeechToTextParams",
+        word_timings: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Drop the trailing words of a non-final sequentially decoded chunk.
 
         The result is both what the client receives for this chunk and what
         the next chunk's context is built from, so a model that overlaps its
         windows can hand the seam to the window that re-hears it.
+
+        ``word_timings`` is this chunk's own per-word spans (window-local
+        seconds, one entry per word of ``text`` in order) when the model
+        also implements :meth:`build_word_timing_rpc`, and ``None``
+        otherwise -- a model that supports both can use it to decide the
+        drop by where each word's audio actually falls rather than by a
+        fixed count.
         """
         return text
 

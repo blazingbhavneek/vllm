@@ -536,6 +536,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         previous_text = ""
         text = ""
         kept = ""
+        chunk_timings: list[dict[str, Any]] | None = None
         outputs: list[RequestOutput] = []
         issued_ids: list[str] = []
         is_last = idx == len(contexts) - 1
@@ -580,12 +581,29 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 )
                 overrides = self.model_cls.should_retry_chunk(text, stt_params, attempt)
                 if overrides is None:
+                    # Timed here, on the accepted text before any boundary
+                    # drop, so a model whose drop is timestamp-aware can use
+                    # these spans for that decision instead of a blind
+                    # word count -- and the alignment pass never has to run
+                    # twice for the same chunk.
+                    if word_timings is not None and text:
+                        chunk_timings = await self._time_chunk_words(
+                            request,
+                            chunk,
+                            previous_text,
+                            text,
+                            f"{request_id}-{idx}-align",
+                            lora_request,
+                            trace_headers,
+                        )
                     # Drop the seam from the client's text and the next
                     # chunk's context alike, so it is transcribed exactly once.
                     kept = (
                         text
                         if is_last
-                        else self.model_cls.trim_chunk_boundary(text, stt_params)
+                        else self.model_cls.trim_chunk_boundary(
+                            text, stt_params, word_timings=chunk_timings
+                        )
                     )
                     break
 
@@ -616,15 +634,18 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             )
 
         if word_timings is not None and kept:
-            word_timings[idx] = await self._time_chunk_words(
-                request,
-                chunk,
-                previous_text,
-                kept,
-                f"{request_id}-{idx}-align",
-                lora_request,
-                trace_headers,
+            # `chunk_timings` is one entry per word of `text`, in order, so
+            # a boundary drop's trailing words are just as many entries off
+            # the end -- no need to re-align the (possibly trimmed) `kept`.
+            # Guarded the same way `trim_chunk_boundary` guards its own use
+            # of these spans: only trusted when the count actually lines up
+            # with `text`'s words.
+            aligned = (
+                chunk_timings
+                if chunk_timings and len(chunk_timings) == len(text.split())
+                else None
             )
+            word_timings[idx] = (aligned or [])[: len(kept.split())]
 
         for output in outputs:
             yield output

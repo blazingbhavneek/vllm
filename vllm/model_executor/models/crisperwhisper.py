@@ -113,6 +113,17 @@ def _speech_active_seconds(audio: np.ndarray, sample_rate: float) -> float:
     )
 
 
+def _longest_consecutive_run(words: Sequence[str]) -> int:
+    """Length of the longest run of the same word repeated back to back."""
+    longest = current = 0
+    previous = None
+    for word in words:
+        current = current + 1 if word == previous else 1
+        longest = max(longest, current)
+        previous = word
+    return longest
+
+
 class CrisperWhisperStreamingPostProcessor(StreamingTranscriptionPostProcessor):
     """Strip prompt artifacts from streaming deltas.
 
@@ -743,10 +754,16 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         if stt_params.language in cls.no_space_languages:
             return None
 
-        speech_s = _speech_active_seconds(
-            stt_params.audio, stt_params.stt_config.sample_rate
-        )
-        if speech_s < MIN_SPEECH_S or len(text.split()) >= MIN_WORDS_PER_S * speech_s:
+        words = text.split()
+        collapsed = _longest_consecutive_run(words) >= MAX_CONSECUTIVE_REPEATS
+        if not collapsed:
+            speech_s = _speech_active_seconds(
+                stt_params.audio, stt_params.stt_config.sample_rate
+            )
+            collapsed = (
+                speech_s >= MIN_SPEECH_S and len(words) < MIN_WORDS_PER_S * speech_s
+            )
+        if not collapsed:
             return None
 
         # Recovery is stochastic, so escalate rather than repeating a draw.
@@ -765,7 +782,12 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         return " ".join(previous_text.split()[-LONGFORM_CONTEXT_WORDS:])
 
     @classmethod
-    def trim_chunk_boundary(cls, text: str, stt_params: SpeechToTextParams) -> str:
+    def trim_chunk_boundary(
+        cls,
+        text: str,
+        stt_params: SpeechToTextParams,
+        word_timings: list[dict[str, Any]] | None = None,
+    ) -> str:
         # A window boundary can cut a word in half; the next window re-hears
         # that audio, so the tail is handed to it rather than kept mangled.
         if stt_params.language in cls.no_space_languages:
@@ -773,7 +795,30 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         words = text.split()
         if len(words) <= LONGFORM_DROP_WORDS:
             return text
-        return " ".join(words[:-LONGFORM_DROP_WORDS])
+
+        drop_count = LONGFORM_DROP_WORDS
+        if word_timings is not None and len(word_timings) == len(words):
+            # Reference default (timestamp_aware_drop=True): only drop a
+            # trailing word whose own audio starts inside the overlap the
+            # next window re-hears, capped at LONGFORM_DROP_WORDS. A word
+            # that finished before the overlap began is kept -- it was
+            # heard in full, so there is nothing for the next window to
+            # recover.
+            overlap_start_s = (
+                stt_params.stt_config.max_audio_clip_s or 30
+            ) - LONGFORM_STRIDE_S
+            drop_count = 0
+            for entry in reversed(word_timings):
+                if drop_count >= LONGFORM_DROP_WORDS:
+                    break
+                start = entry.get("start")
+                if start is None or start < overlap_start_s:
+                    break
+                drop_count += 1
+
+        if drop_count == 0:
+            return text
+        return " ".join(words[:-drop_count])
 
     @classmethod
     def get_suppress_token_ids(cls, model_config: ModelConfig) -> list[int] | None:
