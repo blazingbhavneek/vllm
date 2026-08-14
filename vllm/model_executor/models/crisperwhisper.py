@@ -624,6 +624,13 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
     # Word timings are recovered by a second, teacher-forced pass; see
     # get_alignment_prompt and fetch_word_timings.
     supports_word_timings = True
+    # The reference's chunked-LCS strategy was tried here and reverted:
+    # overlapping windows land most chunks mid-utterance (unlike disjoint
+    # mode's low-energy split points, which favor natural pauses), which
+    # this model was never trained to start from without a <ctx> hint --
+    # verified on real audio, a large fraction of chunks decoded to empty
+    # text with no continuation context to recover from it. The reference
+    # itself defaults to "continuation", not chunked-LCS, for this reason.
 
     @classmethod
     def _mode_tags(cls, mode: str) -> str:

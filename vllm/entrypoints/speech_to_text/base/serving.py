@@ -901,8 +901,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         chunks: list[np.ndarray] = []
         engine_inputs: list[EngineInput] = []
-        # Only the sequential path times words; it is where a chunk's
-        # accepted transcript is known before the response is built.
+        # `words` only ever means something for a plain transcript: verbose
+        # segments already carry their own timing, and translation has no
+        # word-for-word correspondence to time.
+        wants_word_timings = (
+            self.supports_word_timings
+            and request.response_format not in ("verbose_json", "diarized_json")
+        )
         chunk_word_timings: dict[int, list[dict[str, Any]]] | None = None
         if sequential:
             # Prompts depend on the preceding chunk's transcript, so they are
@@ -913,6 +918,24 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                 request_id=request_id,
                 sequential=True,
             )
+            if wants_word_timings:
+                chunk_word_timings = {}
+        elif wants_word_timings:
+            # Concurrent chunks have no continuation context to thread
+            # between them, so nothing about timing them depends on the
+            # sequential path -- only the raw audio needs to survive past
+            # prompt-building, for the alignment pass once each chunk's own
+            # text is known.
+            chunks, duration_s, chunk_start_offsets = await self._prepare_chunks(
+                request=request,
+                audio_data=audio_data,
+                request_id=request_id,
+            )
+            parsed_prompts = [
+                self._build_chunk_prompt(request, chunk)[0] for chunk in chunks
+            ]
+            engine_inputs = await self.renderer.render_cmpl_async(parsed_prompts)
+            chunk_word_timings = {}
         else:
             (
                 engine_inputs,
@@ -981,9 +1004,8 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             contexts = [
                 asyncio.get_running_loop().create_future() for _ in range(len(chunks))
             ]
-            # Filled in by each chunk once its transcript is accepted.
-            if self.supports_word_timings:
-                chunk_word_timings = {}
+            # `chunk_word_timings`, if wanted, was set up above; each chunk
+            # fills in its own entry once its transcript is accepted.
             list_result_generator = [
                 self._generate_chunk_sequentially(
                     idx,
@@ -1093,6 +1115,28 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     chunk_text_parts[idx].append(
                         self.model_cls.post_process_output(raw_text)
                     )
+
+            if not sequential and chunk_word_timings is not None:
+                # The sequential path times each chunk as it is accepted;
+                # here every chunk decoded independently, so they are all
+                # known only now, and are timed together, concurrently --
+                # one chunk's alignment pass no more depends on another's
+                # than its decode did.
+                timed_idxs = [i for i in range(len(chunks)) if chunk_text_parts[i]]
+                timed = await asyncio.gather(*(
+                    self._time_chunk_words(
+                        request,
+                        chunks[i],
+                        "",
+                        "".join(chunk_text_parts[i]),
+                        f"{request_id}-{i}-align",
+                        lora_request,
+                        trace_headers,
+                    )
+                    for i in timed_idxs
+                ))
+                chunk_word_timings.update(zip(timed_idxs, timed))
+
             total_segments = [
                 segment
                 for segment_parts in chunk_segment_parts
@@ -1100,6 +1144,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             ]
             text_parts = [text for text_part in chunk_text_parts for text in text_part]
             text = separator.join(text_parts)
+            words = _merge_chunk_word_timings(chunk_word_timings, chunk_start_offsets)
             if self.task_type == "transcribe":
                 final_response: ResponseType
                 # add usage in TranscriptionResponse.
@@ -1140,9 +1185,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                         TranscriptionResponse(
                             text=text,
                             usage=usage,
-                            words=_merge_chunk_word_timings(
-                                chunk_word_timings, chunk_start_offsets
-                            ),
+                            words=words,
                         ),
                     )
                 else:
