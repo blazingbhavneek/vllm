@@ -14,6 +14,10 @@ import pytest
 
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
 from vllm.model_executor.models.crisperwhisper import (
+    EARLY_EOT_CONFIDENT_PROB,
+    EARLY_EOT_STOP_PROB_THRESHOLD,
+    EARLY_EOT_TAIL_MIN_FINAL_S,
+    EARLY_EOT_TAIL_MIN_NONFINAL_S,
     FALLBACK_TEMPERATURES,
     LONGFORM_DROP_WORDS,
     LONGFORM_STRIDE_S,
@@ -187,3 +191,87 @@ def test_retry_ignores_no_space_languages():
     params = _params(language="ja")
     text = " ".join(["あ"] * (MAX_CONSECUTIVE_REPEATS + 5))
     assert MODEL.should_retry_chunk(text, params, attempt=0) is None
+
+
+# ---------------------------------------------------------------------------
+# should_attempt_early_eot_recovery / is_eot_stop_confident /
+# is_recovery_confident
+# ---------------------------------------------------------------------------
+
+
+def _noisy_audio(duration_s: float, sample_rate: int = 16_000) -> np.ndarray:
+    return np.random.RandomState(1).uniform(
+        -0.1, 0.1, int(duration_s * sample_rate)
+    ).astype(np.float32)
+
+
+def test_eot_gap_needs_a_placed_word():
+    chunk = _noisy_audio(10.0)
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, _params(), [{"word": "x", "start": 0.0, "end": None}], is_last=False,
+    ) is False
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, _params(), [], is_last=False,
+    ) is False
+
+
+def test_eot_gap_fires_when_speech_remains_after_the_last_word():
+    chunk = _noisy_audio(10.0)
+    timings = [{"word": "hi", "start": 0.0, "end": 2.0}]
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, _params(), timings, is_last=False,
+    ) is True  # 8s of noise left, well past the 4.0s non-final floor
+
+
+def test_eot_gap_does_not_fire_when_nothing_is_left_to_hear():
+    chunk = _noisy_audio(10.0)
+    timings = [{"word": "hi", "start": 0.0, "end": 9.5}]
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, _params(), timings, is_last=False,
+    ) is False  # 0.5s left, under the 4.0s non-final floor
+
+
+def test_eot_gap_uses_the_smaller_final_floor():
+    chunk = _noisy_audio(10.0)
+    # 7s left clears the 2.0s final floor but not the 4.0s non-final one.
+    timings = [{"word": "hi", "start": 0.0, "end": 3.0}]
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, _params(), timings, is_last=True,
+    ) is True
+    assert EARLY_EOT_TAIL_MIN_FINAL_S < EARLY_EOT_TAIL_MIN_NONFINAL_S
+
+
+def test_eot_gap_ignores_no_space_languages():
+    chunk = _noisy_audio(10.0)
+    params = _params(language="ja")
+    timings = [{"word": "hi", "start": 0.0, "end": 1.0}]
+    assert MODEL.should_attempt_early_eot_recovery(
+        chunk, params, timings, is_last=False,
+    ) is False
+
+
+def test_eot_stop_confidence_threshold():
+    assert MODEL.is_eot_stop_confident(EARLY_EOT_STOP_PROB_THRESHOLD) is True
+    assert MODEL.is_eot_stop_confident(EARLY_EOT_STOP_PROB_THRESHOLD - 0.01) is False
+
+
+def test_recovery_confidence_threshold():
+    assert MODEL.is_recovery_confident(EARLY_EOT_CONFIDENT_PROB) is True
+    assert MODEL.is_recovery_confident(EARLY_EOT_CONFIDENT_PROB - 0.01) is False
+
+
+def test_early_eot_thresholds_match_the_reference_defaults():
+    # EarlyEotConfig in crisperwhisper/longform/base.py.
+    assert EARLY_EOT_STOP_PROB_THRESHOLD == 0.7
+    assert EARLY_EOT_CONFIDENT_PROB == 0.9
+    assert EARLY_EOT_TAIL_MIN_FINAL_S == 2.0
+    assert EARLY_EOT_TAIL_MIN_NONFINAL_S == 4.0
+
+
+def test_early_eot_recovery_is_off_by_default():
+    from vllm.model_executor.models.interfaces import SupportsTranscription
+    from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
+
+    assert MODEL.supports_early_eot_recovery is True
+    assert WhisperForConditionalGeneration.supports_early_eot_recovery is False
+    assert SupportsTranscription.supports_early_eot_recovery is False

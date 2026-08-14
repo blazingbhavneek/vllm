@@ -1265,6 +1265,16 @@ class SupportsTranscription(Protocol):
     layer themselves; the engine output structures carry nothing for them.
     """
 
+    supports_early_eot_recovery: ClassVar[bool] = False
+    """
+    A sequentially-decoded chunk that stops with low confidence, leaving
+    speech-active audio unheard, is worth a forced continuation to check
+    whether it stopped too early. Requires ``supports_sequential_chunking``
+    and ``supports_word_timings`` (the gate needs a chunk's own word
+    timings), and implies an override of
+    :meth:`should_attempt_early_eot_recovery`.
+    """
+
     supports_explicit_language_detection: ClassVar[bool] = False
     """
     Transcription models that require an explicit language detection step
@@ -1435,6 +1445,42 @@ class SupportsTranscription(Protocol):
         redone decodes, starting at 0.
         """
         return None
+
+    @classmethod
+    def should_attempt_early_eot_recovery(
+        cls,
+        chunk: np.ndarray,
+        stt_params: "SpeechToTextParams",
+        word_timings: list[dict[str, Any]],
+        is_last: bool,
+    ) -> bool:
+        """Gate 1 of early-EOT recovery: is it worth even checking?
+
+        Only called when ``supports_early_eot_recovery`` is True, which
+        implies an override. Audio-only and cheap (no engine call), so it
+        runs before the confidence check that does need one -- most chunks
+        stop with nothing left to hear and are dismissed here.
+        """
+        return False
+
+    @classmethod
+    def is_eot_stop_confident(cls, stop_prob: float) -> bool:
+        """Gate 2: was this chunk's stop confident enough to leave alone?
+
+        Only called when ``supports_early_eot_recovery`` is True and gate 1
+        passed, which implies an override.
+        """
+        return True
+
+    @classmethod
+    def is_recovery_confident(cls, stop_prob: float) -> bool:
+        """Whether a forced continuation's own new stop is confident enough
+        to keep, rather than reverting to the original text.
+
+        Only called when ``supports_early_eot_recovery`` is True and a
+        recovery attempt actually ran, which implies an override.
+        """
+        return False
 
     @classmethod
     def get_suppress_token_ids(cls, model_config: "ModelConfig") -> list[int] | None:

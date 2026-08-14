@@ -235,10 +235,13 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         self.max_audio_filesize_mb = envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
         self.max_audio_decode_duration_s: int = envs.VLLM_MAX_AUDIO_DECODE_DURATION_S
         self.max_audio_decode_bytes: int = envs.VLLM_MAX_AUDIO_DECODE_BYTES
-        # Duck-typed model stubs may predate this attribute, so it is read
-        # defensively, as supports_explicit_language_detection already is.
+        # Duck-typed model stubs may predate these attributes, so they are
+        # read defensively, as supports_explicit_language_detection already is.
         self.supports_word_timings = getattr(
             self.model_cls, "supports_word_timings", False
+        )
+        self.supports_early_eot_recovery = getattr(
+            self.model_cls, "supports_early_eot_recovery", False
         )
         if self.model_cls.supports_segment_timestamp or self.supports_word_timings:
             # Word timing groups tokens into words before asking the workers
@@ -596,6 +599,33 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                             lora_request,
                             trace_headers,
                         )
+
+                    if (
+                        self.supports_early_eot_recovery
+                        and chunk_timings
+                        and self.model_cls.should_attempt_early_eot_recovery(
+                            chunk, stt_params, chunk_timings, is_last
+                        )
+                    ):
+                        recovered = await self._recover_early_eot(
+                            request, chunk, previous_text, text, outputs,
+                            params, f"{request_id}-{idx}", lora_request,
+                            trace_headers,
+                        )
+                        if recovered is not None:
+                            logger.info(
+                                "Chunk %d of %s recovered from a premature stop",
+                                idx, request_id,
+                            )
+                            text = recovered
+                            # Content changed -- the timing pass and its
+                            # word count both need to reflect the recovery.
+                            chunk_timings = await self._time_chunk_words(
+                                request, chunk, previous_text, text,
+                                f"{request_id}-{idx}-align", lora_request,
+                                trace_headers,
+                            )
+
                     # Drop the seam from the client's text and the next
                     # chunk's context alike, so it is transcribed exactly once.
                     kept = (
@@ -717,6 +747,93 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             for word, (start, end) in zip(words, spans)
             if start is not None and end is not None
         ]
+
+    async def _recover_early_eot(
+        self,
+        request: SpeechToTextRequest,
+        chunk: np.ndarray,
+        previous_text: str,
+        text: str,
+        outputs: list[RequestOutput],
+        params: SamplingParams,
+        request_id: str,
+        lora_request: LoRARequest | None,
+        trace_headers: Mapping[str, str] | None,
+    ) -> str | None:
+        """Force a chunk's decode past a premature stop and keep it only if
+        that resolves into a confident end of its own, mirroring the
+        reference's ``recover_early_eot``.
+
+        Gate 1 (audio-only) is the caller's job, since it needs a chunk's
+        word timings; this is gate 2 onward, which needs the engine.
+        Mutates `outputs` in place on a kept recovery, so what gets yielded
+        to the client matches the returned text. Streaming is skipped: a
+        chunk boundary already sent to the client cannot be un-sent, and
+        this is worth the added request-count cost only for the rare
+        chunk that actually collapsed early.
+        """
+        if params.output_kind == RequestOutputKind.DELTA or not outputs:
+            return None
+
+        last = outputs[-1].outputs[0]
+        if (
+            not last.token_ids
+            or not last.logprobs
+            or last.token_ids[-1] != self.tokenizer.eos_token_id
+        ):
+            return None
+        stop_entry = last.logprobs[-1].get(last.token_ids[-1])
+        if stop_entry is None:
+            return None
+        if self.model_cls.is_eot_stop_confident(math.exp(stop_entry.logprob)):
+            return None
+
+        _, stt_params = self._build_chunk_prompt(request, chunk, previous_text)
+        prompt = self.model_cls.get_alignment_prompt(stt_params, text)
+        if prompt is None:
+            return None
+        parsed = parse_model_prompt(self.model_config, prompt)
+        (engine_input,) = await self.renderer.render_cmpl_async([parsed])
+        if engine_input.get("type") != "enc_dec":
+            return None
+        engine_input = cast(EncoderDecoderInput, engine_input)
+
+        # Same budget as the chunk itself, and EOS banned for one token so
+        # the decode cannot just stop again immediately; free afterward.
+        recovery_params = SamplingParams(
+            max_tokens=params.max_tokens, min_tokens=1, temperature=0.0,
+            logprobs=0,
+        )
+        recovery_outputs: list[RequestOutput] = []
+        async for output in self.engine_client.generate(
+            engine_input, recovery_params, f"{request_id}-recover",
+            lora_request=lora_request, trace_headers=trace_headers,
+        ):
+            recovery_outputs.append(output)
+        if not recovery_outputs:
+            return None
+
+        suffix_text = self.model_cls.post_process_output(
+            self._collect_chunk_text(recovery_outputs, recovery_params)
+        )
+        if not suffix_text.strip():
+            return None  # forced past the stop, but found nothing new
+
+        new_last = recovery_outputs[-1].outputs[0]
+        confident = False
+        if new_last.token_ids and new_last.logprobs:
+            new_entry = new_last.logprobs[-1].get(new_last.token_ids[-1])
+            if new_entry is not None and new_last.token_ids[-1] == (
+                self.tokenizer.eos_token_id
+            ):
+                confident = self.model_cls.is_recovery_confident(
+                    math.exp(new_entry.logprob)
+                )
+        if not confident:
+            return None
+
+        outputs[-1].outputs[0].text = text + suffix_text
+        return self.model_cls.post_process_output(text + suffix_text)
 
     def _preprocess_verbose_prompt(self, prompt: EncoderDecoderDictPrompt):
         dec_prompt = prompt["decoder_prompt"]
@@ -980,6 +1097,15 @@ class SpeechToTextBaseServing(GenerateBaseServing):
 
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1
+        elif (
+            sequential
+            and self.supports_early_eot_recovery
+            and isinstance(sampling_params, SamplingParams)
+        ):
+            # The confidence of a chunk's own stop is read off the same
+            # forward pass that already produced it -- no extra request --
+            # as long as this is asked for up front.
+            sampling_params.logprobs = 0
 
         if self.suppress_token_ids and isinstance(sampling_params, SamplingParams):
             # Beam search has no logit_bias equivalent, so suppression only

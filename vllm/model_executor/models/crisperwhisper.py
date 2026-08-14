@@ -80,6 +80,15 @@ LONGFORM_DROP_WORDS = 2
 # the same word is a collapsed decode, not real speech.
 MAX_CONSECUTIVE_REPEATS = 8
 
+# Reference defaults, `EarlyEotConfig` in crisperwhisper/longform/base.py.
+# Notably `*_pro` checkpoints can emit an over-confident EOT at a
+# sentence-final pause when continuation context is present, truncating the
+# rest of a chunk; these gate a forced continuation past such a stop.
+EARLY_EOT_STOP_PROB_THRESHOLD = 0.7
+EARLY_EOT_CONFIDENT_PROB = 0.9
+EARLY_EOT_TAIL_MIN_FINAL_S = 2.0
+EARLY_EOT_TAIL_MIN_NONFINAL_S = 4.0
+
 # Captured passes retained per model, awaiting their alignment call.
 CAPTURE_MAX_ENTRIES = 64
 
@@ -624,6 +633,10 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
     # Word timings are recovered by a second, teacher-forced pass; see
     # get_alignment_prompt and fetch_word_timings.
     supports_word_timings = True
+    # See should_attempt_early_eot_recovery; reference default is also on
+    # for every checkpoint, not just the *_pro ones it names as most
+    # affected, since the gate costs nothing on a chunk that doesn't need it.
+    supports_early_eot_recovery = True
     # The reference's chunked-LCS strategy was tried here and reverted:
     # overlapping windows land most chunks mid-utterance (unlike disjoint
     # mode's low-energy split points, which favor natural pauses), which
@@ -775,6 +788,46 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
 
         # Recovery is stochastic, so escalate rather than repeating a draw.
         return {"temperature": FALLBACK_TEMPERATURES[attempt]}
+
+    @classmethod
+    def should_attempt_early_eot_recovery(
+        cls,
+        chunk: np.ndarray,
+        stt_params: SpeechToTextParams,
+        word_timings: list[dict[str, Any]],
+        is_last: bool,
+    ) -> bool:
+        # Word counting -- and word timing -- is meaningless for languages
+        # written without spaces; the alignment this recovery needs was
+        # never asked for them either.
+        if stt_params.language in cls.no_space_languages:
+            return False
+
+        ends = [w["end"] for w in word_timings if w.get("end") is not None]
+        if not ends:
+            return False  # no placed word to measure a tail from
+
+        last_end = max(ends)
+        sample_rate = stt_params.stt_config.sample_rate
+        tail = chunk[int(last_end * sample_rate) :]
+        gap = _speech_active_seconds(tail, sample_rate)
+        tail_min = (
+            EARLY_EOT_TAIL_MIN_FINAL_S if is_last else EARLY_EOT_TAIL_MIN_NONFINAL_S
+        )
+        return gap >= tail_min
+
+    @classmethod
+    def is_eot_stop_confident(cls, stop_prob: float) -> bool:
+        """Gate 2: was this chunk's stop confident enough to leave alone?"""
+        return stop_prob >= EARLY_EOT_STOP_PROB_THRESHOLD
+
+    @classmethod
+    def is_recovery_confident(cls, stop_prob: float) -> bool:
+        """A forced continuation is kept only if it then stops confidently
+        on its own -- a genuine collapse finds a new confident sentence
+        end when pushed past the pause; a hallucination into trailing
+        silence or a repetition loop does not, so it is reverted."""
+        return stop_prob >= EARLY_EOT_CONFIDENT_PROB
 
     @classmethod
     def get_chunk_context(
