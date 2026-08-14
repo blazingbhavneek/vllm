@@ -320,22 +320,11 @@ class CrossAttentionCapture:
         self._mels.clear()
 
 
-def fetch_word_timings(
-    worker,
-    key_id: str,
-    word_token_indices: Sequence[Sequence[int]],
-    token_ids: Sequence[int],
-) -> list[tuple[float | None, float | None]] | None:
-    """`collective_rpc` entry point: align one captured pass, in the worker.
-
-    Passed as the callable form of `EngineClient.collective_rpc`, so no engine
-    output structure has to carry this and no other model's path is touched.
-    Only the spans cross back, never the attention matrix.
-    """
-    model = getattr(getattr(worker, "model_runner", None), "model", None)
-    if not isinstance(model, CrisperWhisperForConditionalGeneration):
-        return None
-    return model.word_timings(key_id, word_token_indices, token_ids)
+# The worker-side entry point, reached as
+# `collective_rpc("call_model_capability", args=(WORD_TIMING_CAPABILITY, ...))`.
+# Only a name and plain data cross the engine boundary, and only the finished
+# spans come back -- never the attention matrix.
+WORD_TIMING_CAPABILITY = "word_timings"
 
 
 def capture_key(token_ids: Sequence[int]) -> str:
@@ -545,23 +534,33 @@ class CrisperWhisperDecoder(nn.Module):
         if capture is None:
             return
 
-        capture.begin([])
+        # `begin()` also claims this step's pending mels (from `offer_mels`),
+        # so it must run exactly once per forward: an empty-slices call here
+        # first would consume and drop them before the real slices got a
+        # chance to.
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, dict):
             metadata = metadata.get(self.layers[0].encoder_attn.attn.layer_name)
-        if metadata is None:
-            return
 
-        query_start_loc = getattr(metadata, "query_start_loc_cpu", None)
-        encoder_seq_lens = getattr(metadata, "encoder_seq_lens_cpu", None)
-        if query_start_loc is None or encoder_seq_lens is None:
+        # The backend's built metadata (e.g. `FlashAttentionMetadata`) carries
+        # no CPU-side mirrors of its own -- those only exist transiently on
+        # `CommonAttentionMetadata` during `.build()`. `query_start_loc` is
+        # left as the decoder's own per-request offsets; the cross-attention
+        # builder substitutes `seq_lens` with each request's encoder length
+        # (`cross_attention.py`'s `new_metadata.seq_lens = ...encoder_seq_lens`).
+        # This runs only on encoder-bearing passes, already eager, so a CPU
+        # sync here does not touch a compiled or graph-captured region.
+        query_start_loc = getattr(metadata, "query_start_loc", None)
+        encoder_seq_lens = getattr(metadata, "seq_lens", None)
+        if metadata is None or query_start_loc is None or encoder_seq_lens is None:
+            capture.begin([])
             return
 
         capture.begin(
             batch_request_slices(
                 input_ids,
-                np.asarray(query_start_loc),
-                np.asarray(encoder_seq_lens),
+                query_start_loc.cpu().numpy(),
+                encoder_seq_lens.cpu().numpy(),
             )
         )
 
@@ -687,14 +686,14 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         cls,
         token_ids: list[int],
         token_pieces: list[str],
-    ) -> tuple[Any, tuple, list[str]] | None:
+    ) -> tuple[str, tuple, list[str]] | None:
         word_token_indices, word_texts = group_tokens_into_words(
             token_ids, token_pieces
         )
         if not word_token_indices:
             return None
         return (
-            fetch_word_timings,
+            WORD_TIMING_CAPABILITY,
             (capture_key(token_ids), word_token_indices, token_ids),
             word_texts,
         )

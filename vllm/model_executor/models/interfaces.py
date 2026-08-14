@@ -1384,14 +1384,16 @@ class SupportsTranscription(Protocol):
         cls,
         token_ids: list[int],
         token_pieces: list[str],
-    ) -> tuple[Callable[..., Any], tuple, list[str]] | None:
+    ) -> tuple[str, tuple, list[str]] | None:
         """How to collect word timings from the workers, and for which words.
 
-        Returns ``(worker_fn, args, word_texts)``, where ``worker_fn`` is
-        handed to :meth:`EngineClient.collective_rpc` and must return one
-        ``(start, end)`` per entry of ``word_texts``. Keeping the call here
-        means no engine output structure has to carry timings. ``None``
-        disables timing.
+        Returns ``(capability, args, word_texts)``. ``capability`` names a
+        method on this model class, which the workers invoke through
+        :meth:`WorkerBase.call_model_capability` and which must return one
+        ``(start, end)`` per entry of ``word_texts``. Only a name and plain
+        data cross the engine boundary -- a callable would require insecure
+        serialization -- and no engine output structure has to carry timings.
+        ``None`` disables timing.
         """
         return None
 

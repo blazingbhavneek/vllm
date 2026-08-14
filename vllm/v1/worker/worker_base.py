@@ -135,6 +135,19 @@ class WorkerBase:
 
         return format_model_inspection(self.get_model())
 
+    def call_model_capability(self, name: str, args: tuple = ()) -> Any:
+        """Invoke an optional, data-only method on the model.
+
+        `collective_rpc` can only carry a method *name* and plain data across
+        the engine boundary; a callable would need insecure serialization. This
+        lets a model return auxiliary results computed where the tensors
+        already live. Models without the method return None.
+        """
+        fn = getattr(self.get_model(), name, None)
+        if not callable(fn):
+            return None
+        return fn(*args)
+
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load model onto target device."""
         raise NotImplementedError

@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm.model_executor.models.crisperwhisper import (
+    WORD_TIMING_CAPABILITY,
     CrisperWhisperCrossAttention,
     CrisperWhisperDecoder,
     CrisperWhisperDecoderLayer,
@@ -19,7 +20,6 @@ from vllm.model_executor.models.crisperwhisper import (
     batch_request_slices,
     capture_key,
     cross_attention_probs,
-    fetch_word_timings,
 )
 from vllm.model_executor.models.whisper import (
     WhisperCrossAttention,
@@ -254,4 +254,11 @@ def test_pop_frees_the_capture():
 
 def test_rpc_entry_ignores_other_models():
     """collective_rpc reaches every worker, including non-CrisperWhisper ones."""
-    assert fetch_word_timings(object(), "k", [[0]], [1]) is None
+    from vllm.v1.worker.worker_base import WorkerBase
+
+    class _PlainModelWorker:
+        get_model = staticmethod(lambda: object())
+        call_model_capability = WorkerBase.call_model_capability
+
+    worker = _PlainModelWorker()
+    assert worker.call_model_capability(WORD_TIMING_CAPABILITY, ("k", [[0]], [1])) is None

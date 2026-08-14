@@ -683,8 +683,10 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         if plan is None:
             return []
 
-        worker_fn, args, words = plan
-        results = await self.engine_client.collective_rpc(worker_fn, args=args)
+        capability, args, words = plan
+        results = await self.engine_client.collective_rpc(
+            "call_model_capability", args=(capability, args)
+        )
         spans = next((result for result in results if result), None)
         if not spans:
             return []
