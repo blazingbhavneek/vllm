@@ -705,19 +705,31 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
     `extra_body={"vllm_xargs": '{"crisper_mode": "intended"}'}` for a cleaned-up
     transcript. `prompt` supplies continuation context and `hotwords` supplies hotwords —
     the latter is trained into the `*_pro` checkpoints only and may degrade standard
-    checkpoints. Translation, `verbose_json` and segment timestamps are unsupported: word
-    timing comes from cross-attention DTW, which vLLM does not expose. The checkpoint's
-    `suppress_tokens` list is applied on every decoding step, matching Hugging Face; start
-    the server with `--generation-config vllm` to opt out. CrisperWhisper **v1**
-    (`nyrahealth/CrisperWhisper`) is a plain Whisper checkpoint and already works via
-    `WhisperForConditionalGeneration`. Weights are under a non-commercial research license
-    (Pro checkpoints: commercial license available).
+    checkpoints. Translation, `verbose_json`, and segment timestamps are unsupported, but
+    per-word timestamps are: non-streaming responses carry a `words` field (from
+    cross-attention DTW, one extra teacher-forced pass per chunk) in both
+    `transcribe_mode`s. The checkpoint's `suppress_tokens` list is applied on every
+    decoding step, matching Hugging Face; start the server with `--generation-config vllm`
+    to opt out. CrisperWhisper **v1** (`nyrahealth/CrisperWhisper`) is a plain Whisper
+    checkpoint and already works via `WhisperForConditionalGeneration`. Weights are under a
+    non-commercial research license (Pro checkpoints: commercial license available).
+
+!!! note
+    Some checkpoints (the reference implementation names `*_pro` specifically) can emit an
+    over-confident end-of-text at a sentence-final pause in `transcribe_mode="continuation"`,
+    truncating the rest of a chunk. vLLM detects and recovers this by default, the same as
+    the reference: a chunk that stops with low confidence and speech-active audio still
+    unheard gets a forced continuation, kept only if it then reaches a confident stop of its
+    own. Non-streaming requests only — a chunk boundary already sent to a streaming client
+    can't be revised.
 
 !!! note
     ASR models can loop on degenerate audio, repeating a word or phrase until the token
-    budget runs out. CrisperWhisper's reference implementation repairs this by banning the
-    token that would start one repeat too many; the same is available in vLLM by starting
-    the server with
+    budget runs out. In `transcribe_mode="continuation"`, a chunk that repeats the same
+    word 8 or more times in a row is re-decoded with escalated sampling temperature by
+    default, no configuration needed. For every mode, the reference implementation's own
+    repair — banning the token that would start one repeat too many during generation
+    itself — is available by starting the server with
     `--logits-processors vllm.v1.sample.logits_processor.consecutive_ngram:ConsecutiveNgramBlockingLogitsProcessor`
     and passing `extra_body={"vllm_xargs": '{"consecutive_ngram_block_reps": [8, 8, 3, 3, 3]}'}`.
     The i-th entry caps consecutive repeats of `(i + 1)`-grams; `0` disables that size.
