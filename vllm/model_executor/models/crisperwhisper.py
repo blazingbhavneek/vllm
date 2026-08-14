@@ -71,11 +71,14 @@ _ENERGY_FRAME_S = 0.01
 LONGFORM_STRIDE_S = 26.0
 LONGFORM_CONTEXT_WORDS = 12
 LONGFORM_CONTEXT_CHARS = 40
-# The reference default (timestamp_aware_drop=True) drops a trailing word only
-# when its audio starts inside the overlap. That needs per-word timings from
-# cross-attention DTW, which vLLM cannot expose, so this is the reference's
-# timestamp_aware_drop=False path: a fixed drop at every non-final boundary.
+# Ceiling on a timestamp-aware drop (see `trim_chunk_boundary`), and the
+# fixed drop used when word timings are unavailable for a chunk.
 LONGFORM_DROP_WORDS = 2
+
+# Reference default (`DEFAULT_REPAIR_THRESHOLDS[1]` in `hallucination.py`,
+# also `consecutive_ngram_block_reps[0]`): this many consecutive repeats of
+# the same word is a collapsed decode, not real speech.
+MAX_CONSECUTIVE_REPEATS = 8
 
 # Captured passes retained per model, awaiting their alignment call.
 CAPTURE_MAX_ENTRIES = 64
