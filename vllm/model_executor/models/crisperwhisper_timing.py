@@ -27,6 +27,10 @@ _PROMPT_TAG_PREFIXES = ("[verbatim_", "[intended_")
 _MARKER_PIECES = frozenset(
     {"<ctx>", "<ectx>", "<htx>", "<ehtx>", "<vtx>", "<evtx>", "<sot>", "<eot>"}
 )
+# The prompt's <ctx>/<htx>/<vtx> spans carry prior-context or hotword text --
+# real words, but not part of what this pass generated -- so everything
+# between an opener and its closer is skipped, not just the markers.
+_SPAN_CLOSERS = {"<ctx>": "<ectx>", "<htx>": "<ehtx>", "<vtx>": "<evtx>"}
 
 
 @dataclass
@@ -78,6 +82,7 @@ def group_tokens_into_words(
 
     current_indices: list[int] = []
     current_text = ""
+    span_closer: str | None = None
 
     def flush() -> None:
         nonlocal current_indices, current_text
@@ -88,6 +93,15 @@ def group_tokens_into_words(
         current_text = ""
 
     for index, (token_id, piece) in enumerate(zip(token_ids, token_pieces)):
+        if span_closer is not None:
+            flush()
+            if piece == span_closer:
+                span_closer = None
+            continue
+        if piece in _SPAN_CLOSERS:
+            flush()
+            span_closer = _SPAN_CLOSERS[piece]
+            continue
         if _is_special_token(piece) or _is_space_token(token_id, piece):
             flush()
             continue

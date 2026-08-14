@@ -349,6 +349,14 @@ class CrossAttentionCapture:
 # spans come back -- never the attention matrix.
 WORD_TIMING_CAPABILITY = "word_timings"
 
+# A capture is only ever consulted through `WORD_TIMING_CAPABILITY`, keyed by
+# the *alignment* pass's own prompt -- never by the plain decode pass (retry
+# attempts included) that produced the text in the first place. That decode
+# pass's own capture is therefore dead on arrival; callers free it through
+# this capability the moment its text is judged, rather than letting it sit
+# in `CrossAttentionCapture` until an unrelated request evicts it.
+DISCARD_CAPTURE_CAPABILITY = "discard_capture"
+
 
 def capture_key(token_ids: Sequence[int]) -> str:
     """Stable id for a capture pass, derived from its decoder tokens.
@@ -733,6 +741,10 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
         )
 
     @classmethod
+    def build_discard_rpc(cls, token_ids: list[int]) -> tuple[str, tuple] | None:
+        return (DISCARD_CAPTURE_CAPABILITY, (capture_key(token_ids),))
+
+    @classmethod
     def get_language_detection_prompt(
         cls,
         audio: np.ndarray,
@@ -1000,6 +1012,16 @@ class CrisperWhisperForConditionalGeneration(WhisperForConditionalGeneration):
             np.asarray(attention.cpu()),
             mel,
         )
+
+    def discard_capture(self, key_id: str) -> None:
+        """Free a pass's capture without aligning it.
+
+        For a decode pass whose output is a plain transcript (accepted or
+        retried), not an alignment target -- its capture would otherwise
+        just occupy a slot in `CrossAttentionCapture` until eviction.
+        """
+        if self._alignment_capture is not None:
+            self._alignment_capture.pop(key_id)
 
     @classmethod
     def get_alignment_heads(

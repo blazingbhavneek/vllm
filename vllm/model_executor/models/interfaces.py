@@ -1408,6 +1408,16 @@ class SupportsTranscription(Protocol):
         return None
 
     @classmethod
+    def build_discard_rpc(cls, token_ids: list[int]) -> "tuple[str, tuple] | None":
+        """How to free a plain decode pass's capture, if this model keeps one.
+
+        Same ``(capability, args)`` contract as :meth:`build_word_timing_rpc`
+        minus the word list -- the capability is invoked for its side effect
+        only. ``None`` means this model keeps no such state to free.
+        """
+        return None
+
+    @classmethod
     def trim_chunk_boundary(
         cls,
         text: str,

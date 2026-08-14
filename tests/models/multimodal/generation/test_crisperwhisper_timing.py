@@ -55,8 +55,18 @@ def _sequence() -> tuple[list[int], list[str]]:
     # "la" + "mb" carry no leading space, so they must merge into one word.
     ids = [50258, 100, SPACE, 101, SPACE, 102, SPACE, 103, SPACE, 104, 105, 50257]
     pieces = [
-        "<|startoftranscript|>", "Mary", " ", "had", " ", "a", " ",
-        "little", " ", "la", "mb", "<|endoftext|>",
+        "<|startoftranscript|>",
+        "Mary",
+        " ",
+        "had",
+        " ",
+        "a",
+        " ",
+        "little",
+        " ",
+        "la",
+        "mb",
+        "<|endoftext|>",
     ]
     return ids, pieces
 
@@ -71,6 +81,60 @@ def test_token_grouping_matches_reference():
     assert got_indices == want_indices
     # Specials and the space token must not become words.
     assert got_words == ["Mary", "had", "a", "little", "lamb"]
+
+
+def test_token_grouping_skips_context_and_hotword_spans():
+    # A longform continuation prompt is `{mode tags}<ctx> ... <ectx>` (prior
+    # text, for the model to condition on) `<htx> ... <ehtx>` (hotwords)
+    # `{whisper prefix}{new text}` all as one decoder sequence -- captured
+    # attention spans the whole teacher-forced pass, not just the new text,
+    # so the words inside <ctx>/<htx> must not leak into the result.
+    ids = [
+        1,
+        2,
+        3,
+        100,
+        SPACE,
+        101,
+        4,
+        5,
+        6,
+        SPACE,
+        107,
+        SPACE,
+        108,
+    ]
+    pieces = [
+        "<ctx>",
+        "prior",
+        "words",
+        "<ectx>",
+        " ",
+        "<htx>",
+        "hot",
+        "word",
+        "<ehtx>",
+        " ",
+        "new",
+        " ",
+        "text",
+    ]
+
+    got_indices, got_words = group_tokens_into_words(ids, pieces)
+
+    assert got_words == ["new", "text"]
+    assert got_indices == [[10], [12]]
+
+
+def test_token_grouping_handles_an_unclosed_span():
+    # A truncated or malformed prompt should not spill every following
+    # token into the suppressed span forever.
+    ids = [1, 100, SPACE, 101]
+    pieces = ["<ctx>", "prior", " ", "word"]
+
+    _, got_words = group_tokens_into_words(ids, pieces)
+
+    assert got_words == []
 
 
 @pytest.mark.parametrize("sharpen", [1.0, 3.0, 5.0])

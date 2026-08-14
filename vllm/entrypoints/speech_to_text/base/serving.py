@@ -575,6 +575,14 @@ class SpeechToTextBaseServing(GenerateBaseServing):
                     trace_headers=trace_headers,
                 ):
                     outputs.append(output)
+                if engine_input.get("type") == "enc_dec":
+                    await self._discard_capture(
+                        list(
+                            cast(EncoderDecoderInput, engine_input)[
+                                "decoder_prompt"
+                            ]["prompt_token_ids"]
+                        )
+                    )
 
                 # Clean the text before it is judged or fed forward: control
                 # markers the model echoes back must not land in the next
@@ -748,6 +756,22 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             if start is not None and end is not None
         ]
 
+    async def _discard_capture(self, token_ids: list[int]) -> None:
+        """Free a plain decode pass's capture.
+
+        Only the alignment pass's own capture (a different prompt, popped by
+        :meth:`_fetch_word_timings`) is ever read back, so this one would
+        otherwise just sit in the model's capture store until an unrelated
+        request evicts it.
+        """
+        plan = self.model_cls.build_discard_rpc(token_ids)
+        if plan is None:
+            return
+        capability, args = plan
+        await self.engine_client.collective_rpc(
+            "call_model_capability", args=(capability, args)
+        )
+
     async def _recover_early_eot(
         self,
         request: SpeechToTextRequest,
@@ -810,6 +834,12 @@ class SpeechToTextBaseServing(GenerateBaseServing):
             lora_request=lora_request, trace_headers=trace_headers,
         ):
             recovery_outputs.append(output)
+        # This pass's own capture is never the one read back -- a fresh
+        # alignment pass runs below on acceptance, and nothing reads this
+        # one on rejection either -- so it is freed unconditionally here.
+        await self._discard_capture(
+            list(engine_input["decoder_prompt"]["prompt_token_ids"])
+        )
         if not recovery_outputs:
             return None
 
