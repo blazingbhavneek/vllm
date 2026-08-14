@@ -391,11 +391,11 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         mode = (getattr(request, "vllm_xargs", None) or {}).get("transcribe_mode")
         if mode is None:
             requested = self.asr_config.sequential_chunking
-        elif mode in ("fast", "accurate"):
-            requested = mode == "accurate"
+        elif mode in ("fast", "continuation"):
+            requested = mode == "continuation"
         else:
             raise VLLMValidationError(
-                "transcribe_mode must be 'fast' or 'accurate'",
+                "transcribe_mode must be 'fast' or 'continuation'",
                 parameter="transcribe_mode",
                 value=mode,
             )
@@ -896,7 +896,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         sequential = self._use_sequential_chunking(request)
         if sequential and request.use_beam_search:
             return self.create_error_response(
-                "transcribe_mode='accurate' is not supported with beam search"
+                "transcribe_mode='continuation' is not supported with beam search"
             )
 
         chunks: list[np.ndarray] = []

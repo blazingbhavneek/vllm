@@ -725,11 +725,12 @@ Speech2Text models trained specifically for Automatic Speech Recognition.
 
 !!! note
     Audio longer than 30s is chunked. `WhisperForConditionalGenerationWithAttentionLoss`
-    defaults to `transcribe_mode="accurate"`: overlapping 30s windows decoded one after
-    another, each conditioned on the last words confirmed so far, as in the reference
-    implementation. Pass `extra_body={"vllm_xargs": '{"transcribe_mode": "fast"}'}` for the
-    generic path other ASR models use — disjoint windows decoded concurrently, which is
-    faster but cannot condition across a seam. Other models only support `"fast"`.
+    defaults to `transcribe_mode="continuation"` (named after the reference
+    implementation's own `longform_strategy="continuation"`): overlapping 30s windows
+    decoded one after another, each conditioned on the last words confirmed so far. Pass
+    `extra_body={"vllm_xargs": '{"transcribe_mode": "fast"}'}` for the generic path other
+    ASR models use — disjoint windows decoded concurrently, which is faster but cannot
+    condition across a seam. Other models only support `"fast"`.
 
 #### Realtime Transcription
 
