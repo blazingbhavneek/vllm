@@ -30,6 +30,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.utils.b12x import B12X_BLOCK_CODECS, B12xWarmupUnit, get_b12x_blockscaled
 
+from .modelopt_block_quant_sm90 import (
+    apply_embedding_fallback,
+    apply_linear_fallback,
+    apply_moe_fallback,
+    prewarm_device_checks,
+    sm90_fallback_enabled,
+)
+
 
 @torch.library.custom_op(
     "vllm::modelopt_block_embedding_chunked", mutates_args=("out",)
@@ -65,12 +73,15 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         super().__init__(moe_config)
         self.codec = codec.lower()
         self.block_size, self.block_bytes = B12X_BLOCK_CODECS[self.codec]
-        if moe_config.moe_backend not in ("auto", "b12x"):
+        self.sm90_fallback = not B12xExperts._supports_current_device()
+        if self.sm90_fallback and not sm90_fallback_enabled():
+            raise ValueError("Block-quantized routed experts require b12x on SM12x")
+        if self.sm90_fallback:
+            prewarm_device_checks()
+        if not self.sm90_fallback and moe_config.moe_backend not in ("auto", "b12x"):
             raise ValueError(
                 "Block-quantized routed experts require the b12x MoE backend"
             )
-        if not B12xExperts._supports_current_device():
-            raise ValueError("Block-quantized routed experts require b12x on SM12x")
         if not B12xExperts._supports_parallel_config(moe_config.moe_parallel_config):
             raise ValueError(
                 "Block-quantized supports tensor parallelism without EP or EPLB"
@@ -210,6 +221,8 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
+        if self.sm90_fallback:
+            return
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         prepare_finalize = maybe_make_prepare_finalize(
             moe=self.moe,
@@ -231,6 +244,8 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         shared_experts,
         shared_experts_input,
     ):
+        if self.sm90_fallback:
+            return apply_moe_fallback(layer, x, topk_weights, topk_ids, self.codec)
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,
@@ -261,17 +276,22 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         from vllm.model_executor.kernels.linear import _get_linear_backend
         from vllm.utils.b12x import get_b12x_blockscaled
 
-        if _get_linear_backend(quantization=self.codec) not in ("auto", "b12x"):
-            raise ValueError(
-                "Block-quantized dense weights require the b12x linear backend"
-            )
         api = get_b12x_blockscaled()
-        if (
+        self.sm90_fallback = (
             api is None
             or not hasattr(api, "BlockQuantLinearWeight")
             or not api.is_supported()
-        ):
+        )
+        if self.sm90_fallback and not sm90_fallback_enabled():
             raise ValueError("Block-quantized dense weights require b12x on SM12x")
+        if self.sm90_fallback:
+            prewarm_device_checks()
+        if not self.sm90_fallback and _get_linear_backend(
+            quantization=self.codec
+        ) not in ("auto", "b12x"):
+            raise ValueError(
+                "Block-quantized dense weights require the b12x linear backend"
+            )
 
     def create_weights(
         self,
@@ -312,6 +332,9 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
+        if self.sm90_fallback:
+            return
+
         from b12x.sequence import embedding
 
         from vllm.model_executor.utils import replace_parameter
@@ -414,6 +437,8 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
             raise ValueError(
                 "Block-quantized dense execution requires BF16 activations"
             )
+        if self.sm90_fallback:
+            return apply_linear_fallback(layer, x, bias, self.codec)
         api = get_b12x_blockscaled()
         assert api is not None
         output = api.mm(
@@ -425,6 +450,8 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         return output.view(*x.shape[:-1], layer.b12x_block_weight.out_features)
 
     def embedding(self, layer, input_):
+        if self.sm90_fallback:
+            return apply_embedding_fallback(input_, layer.weight, self.codec)
         plan = layer.b12x_embedding_plans[input_.dtype]
         width = layer.weight.shape[1] * self.block_size
         out = torch.empty(
