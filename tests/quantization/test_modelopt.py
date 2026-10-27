@@ -1605,3 +1605,182 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
             "w2",
             0,
         )
+
+
+_requires_sm80 = pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(80)),
+    reason="Triton block kernels need NVIDIA SM80+",
+)
+
+
+@_requires_sm80
+@pytest.mark.parametrize(
+    "b12x,backend,codec,expected",
+    [
+        (True, "auto", "iq2_xxs", "b12x"),
+        (True, "triton", "iq2_xxs", "triton"),
+        (False, "auto", "iq2_xxs", "triton"),
+        (False, "auto", "q8_0", "triton"),
+        (False, "triton", "q8_0", "triton"),
+        (False, "b12x", "iq2_xxs", "error"),
+        (False, "marlin", "iq2_xxs", "error"),
+        (False, "auto", "iq2_xs", "error"),
+    ],
+)
+def test_modelopt_block_quant_backend_selection(
+    monkeypatch, b12x, backend, codec, expected
+):
+    """b12x stays the SM12x default; elsewhere IQ2_XXS / Q8_0 take Triton, and
+    unsupported requests fail at construction."""
+    import vllm.utils.b12x as b12x_utils
+    from vllm.config import KernelConfig
+    from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+    from vllm.model_executor.layers.quantization.modelopt_block_quant import (
+        ModelOptBlockQuantLinearMethod,
+        ModelOptBlockQuantMoEMethod,
+    )
+
+    monkeypatch.setattr(B12xExperts, "_supports_current_device", lambda: b12x)
+    monkeypatch.setattr(
+        b12x_utils,
+        "get_b12x_blockscaled",
+        lambda: (
+            SimpleNamespace(BlockQuantLinearWeight=object, is_supported=lambda: True)
+            if b12x
+            else None
+        ),
+    )
+    moe_config = _iq2_xs_moe_config()
+    moe_config.moe_backend = backend
+    builders = (
+        lambda: ModelOptBlockQuantMoEMethod(moe_config, codec=codec),
+        lambda: ModelOptBlockQuantLinearMethod(codec),
+    )
+    vllm_config = VllmConfig(kernel_config=KernelConfig(linear_backend=backend))
+    with set_current_vllm_config(vllm_config):
+        for build in builders:
+            if expected == "error":
+                with pytest.raises(ValueError, match=f"ModelOpt {codec.upper()}"):
+                    build()
+            else:
+                assert build().use_triton == (expected == "triton")
+
+
+@_requires_sm80
+def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
+    """IQ2_XXS on traced attention and routed experts, Q8_0 on shared experts,
+    latent projections, lm_head and embeddings: torch.compile + CUDA graphs
+    agree with eager."""
+    from tests.models.utils import check_logprobs_close
+    from vllm import SamplingParams
+
+    def recipe(codec):
+        return {
+            "quant_algo": codec.upper(),
+            "group_size": 256 if codec == "iq2_xxs" else 32,
+            "block_payload_bytes": 66 if codec == "iq2_xxs" else 34,
+            "packing": "ggml",
+        }
+
+    mixer = "model.layers.2.mixer"
+    layers = {
+        f"model.layers.1.mixer.{p}": recipe("iq2_xxs")
+        for p in ("q_proj", "k_proj", "v_proj", "o_proj")
+    }
+    layers[f"{mixer}.experts"] = recipe("iq2_xxs")
+    for p in ("shared_experts.up_proj", "shared_experts.down_proj"):
+        layers[f"{mixer}.{p}"] = recipe("q8_0")
+    for p in ("fc1_latent_proj", "fc2_latent_proj"):
+        layers[f"{mixer}.{p}"] = recipe("q8_0")
+    layers["lm_head"] = recipe("q8_0")
+    layers["model.embed_tokens"] = recipe("q8_0")
+    config = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "torch_dtype": "bfloat16",
+        "vocab_size": 4096,
+        "hidden_size": 4096,
+        "hybrid_override_pattern": "M*E",
+        "num_hidden_layers": 3,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "max_position_embeddings": 4096,
+        "intermediate_size": 8192,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 64,
+        "n_groups": 1,
+        "conv_kernel": 4,
+        "chunk_size": 128,
+        "expand": 1,
+        "mamba_hidden_act": "silu",
+        "use_conv_bias": True,
+        "use_bias": False,
+        "mlp_bias": False,
+        "mlp_hidden_act": "relu2",
+        "layer_norm_epsilon": 1e-5,
+        "n_routed_experts": 16,
+        "num_experts_per_tok": 4,
+        "moe_intermediate_size": 1024,
+        "n_shared_experts": 1,
+        "moe_shared_expert_intermediate_size": 2048,
+        "moe_latent_size": 1024,
+        "routed_scaling_factor": 2.5,
+        "n_group": 1,
+        "topk_group": 1,
+        "norm_topk_prob": True,
+        "tie_word_embeddings": False,
+        "eos_token_id": 2,
+        "bos_token_id": 1,
+        "pad_token_id": 0,
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": None,
+            "ignore": [],
+            "quantized_layers": layers,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    def finite_scales(model):
+        """Dummy loading gives random fp16 block scales; make them small."""
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if name.endswith("weight_scale"):
+                    g = torch.Generator(device=p.device).manual_seed(len(name))
+                    p.copy_(torch.rand(p.shape, device=p.device, generator=g) * 1e-3)
+                    p.add_(2e-4)
+        return sum(
+            getattr(m.quant_method, "use_triton", False)
+            for m in model.modules()
+            if hasattr(m, "quant_method")
+        )
+
+    prompts = [list(range(3 + i, 40 + 7 * i)) for i in range(3)]
+    params = SamplingParams(temperature=0, max_tokens=12, logprobs=5, ignore_eos=True)
+    outputs = []
+    for compiled in (False, True):
+        with vllm_runner(
+            str(tmp_path),
+            load_format="dummy",
+            skip_tokenizer_init=True,
+            max_model_len=256,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            enable_chunked_prefill=True,
+            gpu_memory_utilization=0.3,
+            linear_backend="triton",
+            moe_backend="triton",
+            enforce_eager=not compiled,
+            compilation_config={"cudagraph_capture_sizes": [1, 2, 4]},
+        ) as llm:
+            assert llm.apply_model(finite_scales) == [9]
+            outputs.append(llm.generate_w_logprobs(prompts, params))
+    check_logprobs_close(
+        outputs_0_lst=outputs[0],
+        outputs_1_lst=outputs[1],
+        name_0="eager",
+        name_1="compiled",
+    )
