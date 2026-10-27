@@ -5,6 +5,7 @@
 import torch
 
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -16,6 +17,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
 )
+from vllm.model_executor.layers.fused_moe.experts.modelopt_block_triton_moe import (
+    ModelOptBlockTritonExperts,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -23,20 +27,41 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
 )
+from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
+    iq2_lut,
+    repack_blocks,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 from vllm.utils.b12x import B12X_BLOCK_CODECS, B12xWarmupUnit, get_b12x_blockscaled
 
-from .modelopt_block_quant_sm90 import (
-    apply_embedding_fallback,
-    apply_linear_fallback,
-    apply_moe_fallback,
-    prewarm_device_checks,
-    sm90_fallback_enabled,
-)
+logger = init_logger(__name__)
+
+
+def _use_triton(codec: str, backend: str, b12x_supported: bool, kind: str) -> bool:
+    """Pick b12x (False) or the Triton kernels (True); raise if neither applies."""
+    if backend in ("auto", "b12x") and b12x_supported:
+        return False
+    if (
+        backend in ("auto", "triton")
+        and codec in ("iq2_xxs", "q8_0")
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(80)
+    ):
+        logger.info_once(
+            "Using Triton kernels for ModelOpt %s %s weights.", codec.upper(), kind
+        )
+        return True
+    raise ValueError(
+        f"ModelOpt {codec.upper()} {kind} weights run on b12x (SM120/SM121) or, "
+        f"for IQ2_XXS and Q8_0 on NVIDIA SM80+, on Triton; the requested {kind} "
+        f"backend {backend!r} is not available here."
+    )
 
 
 @torch.library.custom_op(
@@ -73,15 +98,12 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         super().__init__(moe_config)
         self.codec = codec.lower()
         self.block_size, self.block_bytes = B12X_BLOCK_CODECS[self.codec]
-        self.sm90_fallback = not B12xExperts._supports_current_device()
-        if self.sm90_fallback and not sm90_fallback_enabled():
-            raise ValueError("Block-quantized routed experts require b12x on SM12x")
-        if self.sm90_fallback:
-            prewarm_device_checks()
-        if not self.sm90_fallback and moe_config.moe_backend not in ("auto", "b12x"):
-            raise ValueError(
-                "Block-quantized routed experts require the b12x MoE backend"
-            )
+        self.use_triton = _use_triton(
+            self.codec,
+            moe_config.moe_backend,
+            B12xExperts._supports_current_device(),
+            "MoE",
+        )
         if not B12xExperts._supports_parallel_config(moe_config.moe_parallel_config):
             raise ValueError(
                 "Block-quantized supports tensor parallelism without EP or EPLB"
@@ -216,13 +238,25 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         return FusedMoEQuantConfig(
             _a1=FusedMoEQuantDesc(),
             _a2=FusedMoEQuantDesc(),
-            _w1=FusedMoEQuantDesc(dtype=self.codec),
-            _w2=FusedMoEQuantDesc(dtype=self.codec),
+            _w1=FusedMoEQuantDesc(
+                dtype=self.codec, scale=getattr(layer, "w13_weight_scale", None)
+            ),
+            _w2=FusedMoEQuantDesc(
+                dtype=self.codec, scale=getattr(layer, "w2_weight_scale", None)
+            ),
         )
 
     def process_weights_after_loading(self, layer):
-        if self.sm90_fallback:
-            return
+        if self.use_triton:
+            for name in ("w13", "w2"):
+                qweight, scales = repack_blocks(
+                    getattr(layer, f"{name}_weight").data, self.codec
+                )
+                replace_parameter(layer, f"{name}_weight", qweight)
+                layer.register_parameter(
+                    f"{name}_weight_scale",
+                    torch.nn.Parameter(scales, requires_grad=False),
+                )
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         prepare_finalize = maybe_make_prepare_finalize(
             moe=self.moe,
@@ -231,7 +265,13 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
             allow_new_interface=True,
         )
         assert prepare_finalize is not None
-        experts = B12xExperts(self.moe, self.moe_quant_config)
+        if self.use_triton:
+            lut = iq2_lut(layer.w13_weight.device) if self.codec == "iq2_xxs" else None
+            experts = ModelOptBlockTritonExperts(
+                self.moe, self.moe_quant_config, self.codec, lut
+            )
+        else:
+            experts = B12xExperts(self.moe, self.moe_quant_config)
         self.moe_kernel = mk.FusedMoEKernel(prepare_finalize, experts)
         experts.process_weights_after_loading(layer)
 
@@ -244,8 +284,6 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
         shared_experts,
         shared_experts_input,
     ):
-        if self.sm90_fallback:
-            return apply_moe_fallback(layer, x, topk_weights, topk_ids, self.codec)
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,
@@ -277,21 +315,14 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         from vllm.utils.b12x import get_b12x_blockscaled
 
         api = get_b12x_blockscaled()
-        self.sm90_fallback = (
-            api is None
-            or not hasattr(api, "BlockQuantLinearWeight")
-            or not api.is_supported()
+        self.use_triton = _use_triton(
+            self.codec,
+            _get_linear_backend(quantization=self.codec),
+            api is not None
+            and hasattr(api, "BlockQuantLinearWeight")
+            and api.is_supported(),
+            "linear",
         )
-        if self.sm90_fallback and not sm90_fallback_enabled():
-            raise ValueError("Block-quantized dense weights require b12x on SM12x")
-        if self.sm90_fallback:
-            prewarm_device_checks()
-        if not self.sm90_fallback and _get_linear_backend(
-            quantization=self.codec
-        ) not in ("auto", "b12x"):
-            raise ValueError(
-                "Block-quantized dense weights require the b12x linear backend"
-            )
 
     def create_weights(
         self,
@@ -332,12 +363,20 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer):
-        if self.sm90_fallback:
+        if self.use_triton:
+            qweight, scales = repack_blocks(layer.weight.data, self.codec)
+            replace_parameter(layer, "weight", qweight)
+            layer.register_parameter(
+                "weight_scale", torch.nn.Parameter(scales, requires_grad=False)
+            )
+            layer.register_buffer(
+                "iq2_lut",
+                iq2_lut(qweight.device) if self.codec == "iq2_xxs" else None,
+                persistent=False,
+            )
             return
 
         from b12x.sequence import embedding
-
-        from vllm.model_executor.utils import replace_parameter
 
         api = get_b12x_blockscaled()
         assert api is not None
@@ -437,8 +476,17 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
             raise ValueError(
                 "Block-quantized dense execution requires BF16 activations"
             )
-        if self.sm90_fallback:
-            return apply_linear_fallback(layer, x, bias, self.codec)
+        if self.use_triton:
+            out = torch.ops.vllm.modelopt_block_linear(
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                layer.weight_scale,
+                layer.iq2_lut,
+                self.codec,
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.view(*x.shape[:-1], -1)
         api = get_b12x_blockscaled()
         assert api is not None
         output = api.mm(
@@ -450,8 +498,10 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         return output.view(*x.shape[:-1], layer.b12x_block_weight.out_features)
 
     def embedding(self, layer, input_):
-        if self.sm90_fallback:
-            return apply_embedding_fallback(input_, layer.weight, self.codec)
+        if self.use_triton:
+            return torch.ops.vllm.modelopt_block_embedding(
+                input_.reshape(-1), layer.weight, layer.weight_scale
+            ).view(*input_.shape, -1)
         plan = layer.b12x_embedding_plans[input_.dtype]
         width = layer.weight.shape[1] * self.block_size
         out = torch.empty(
