@@ -359,6 +359,77 @@ def _moe_gemm_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_valid_tokens"])
+def _moe_gemv_kernel(
+    a_ptr,
+    qw_ptr,
+    sc_ptr,
+    lut_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    N,
+    K,
+    num_valid_tokens,
+    stride_am,
+    stride_qe,
+    stride_qn,
+    stride_se,
+    stride_sn,
+    stride_cm,
+    top_k: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    CODEC: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """One routed row per program: c[slot] = a[slot // top_k] @ W[e]^T.
+
+    For decode, when there are fewer routed rows than experts: no tensor cores,
+    so no rows are decoded that nobody asked for, and the LUT gather decode
+    beats the 2-bit codes used by `_moe_gemm_kernel`'s `tl.dot` layout.
+    """
+    slot = tl.program_id(0)
+    offs_token = tl.load(sorted_token_ids_ptr + slot).to(tl.int64)
+    valid = offs_token < num_valid_tokens
+    # A padding slot reads row 0 and an expert that exists; only its store is off.
+    row = tl.where(valid, offs_token, 0) // top_k
+    e = tl.load(expert_ids_ptr + slot).to(tl.int64)
+    offs_n = tl.program_id(1) * BN + tl.arange(0, BN)
+    n_mask = offs_n < N
+    a_row = a_ptr + row * stride_am
+    qw_ptr += e * stride_qe
+    sc_ptr += e * stride_se
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        w = _decode_tile(
+            qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
+            CODEC, True, BN, BK,
+        )  # fmt: skip
+        x = tl.load(a_row + k0 + tl.arange(0, BK)).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    if MUL_ROUTED_WEIGHT:
+        weight = tl.load(topk_weights_ptr + offs_token, mask=valid, other=0.0)
+        acc *= weight.to(tl.float32)
+    tl.store(
+        c_ptr + offs_token * stride_cm + offs_n,
+        acc.to(c_ptr.dtype.element_ty),
+        mask=valid & n_mask,
+    )
+
+
+@triton.jit(do_not_specialize=["total", "split"])
+def _splitk_reduce_kernel(p_ptr, out_ptr, total, split, BN: tl.constexpr):
+    """Sum the split-K partials: p [split, total] fp32 -> [total] in out's dtype."""
+    offs = tl.program_id(0) * BN + tl.arange(0, BN)
+    mask = offs < total
+    acc = tl.load(p_ptr + offs, mask=mask, other=0.0)
+    for s in range(1, split):
+        acc += tl.load(p_ptr + s * total + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
 @triton.jit
 def _q8_embedding_kernel(
     ids_ptr, qw_ptr, sc_ptr, out_ptr, H, stride_qn, stride_sn, stride_om,
@@ -391,11 +462,23 @@ def _linear_config(
     else:
         bm, bn, bk, warps = 128 if smem >= 160 * 1024 else 64, 128, 64, 8
     bk = next(b for b in (256, 128, 64, 32) if b <= bk and K % b == 0)
-    # Deterministic split-K (fp32 partials) until the grid covers the GPU twice.
+    # Deterministic split-K (fp32 partials) until the grid covers the GPU a few
+    # times. GEMV tiles are decode-bound, so give them many more CTAs; IQ2 spends
+    # the extra parallelism on unpacking the grid.
     tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
+    target = (8 if codec == "q8_0" else 32) * num_sms if M <= 4 else 2 * num_sms
+    k_steps = K // bk
     split = 1
-    while split < 16 and tiles * split < 2 * num_sms and (K // bk) % (2 * split) == 0:
+    while split < 16 and tiles * split < target and k_steps % (2 * split) == 0:
         split *= 2
+    if split == 1:
+        # No power of two divides the K step count, so the grid stays narrow and
+        # stalls on decode latency: shared_down has 5376 / 256 = 21 steps. Take
+        # any divisor instead, which is still a deterministic fp32 reduction.
+        for d in range(min(16, k_steps), 1, -1):
+            if k_steps % d == 0 and tiles * d < 2 * target:
+                split = d
+                break
     return {
         "BM": bm,
         "BN": bn,
@@ -438,7 +521,14 @@ def launch_linear(
             qweight.stride(0), scales.stride(0), CODEC=_CODEC_ID[codec],
             BM=cfg["BM"], BN=cfg["BN"], BK=cfg["BK"], **launch,
         )  # fmt: skip
-    return out if split == 1 else out.sum(0).to(x.dtype)
+    if split == 1:
+        return out
+    y = x.new_empty((M, N))
+    total = M * N
+    _splitk_reduce_kernel[(triton.cdiv(total, 1024),)](
+        out, y, total, split, BN=1024, num_warps=4
+    )  # fmt: skip
+    return y
 
 
 def dequantize_blocks(
@@ -462,8 +552,9 @@ def dequantize_blocks(
 
 # From this many tokens, dequantize once and use cuBLAS, as AWQ does: the fused
 # GEMM decodes W once per M tile. Capping the bf16 copy at 128 MiB keeps
-# lm_head on the fused GEMM.
-DEQUANT_MIN_M = {"iq2_xxs": 64, "q8_0": 256}
+# lm_head on the fused GEMM. H200 crossovers (2026-10-28): IQ2_XXS from 8,
+# Q8_0 from 64 tokens.
+DEQUANT_MIN_M = {"iq2_xxs": 8, "q8_0": 64}
 DEQUANT_MAX_NUMEL = 1 << 26
 
 
@@ -549,18 +640,77 @@ direct_register_custom_op(
 )
 
 
+def moe_gemv_config(
+    M: int, E: int, top_k: int, codec: str
+) -> dict[str, int] | None:
+    """Tiles for the decode path, or None when `moe_config`'s tiles win.
+
+    One program per routed row: no `moe_align_block_size` padding and no
+    tensor-core transposes, which is what a tiny decode step wants. Measured in
+    serving on Bolt (H200): 1.46x faster at M=1, 1.12x at M=8, 0.90x at M=16,
+    0.66x at M=32 - those wide one-warp grids stop paying for themselves, so
+    above 8 rows `moe_config`'s padded `tl.dot` tiles go back to winning. A
+    standalone kernel sweep disagrees (still 2.6x ahead at M=16); it has no
+    other work on the GPU, serving does.
+    """
+    if M > 8:
+        return None
+    bn, bk, warps = (8, 256, 1) if codec == "iq2_xxs" else (32, 256, 4)
+    return {"BN": bn, "BK": bk, "num_warps": warps, "num_stages": 2}
+
+
+def invoke_block_moe_gemv_kernel(
+    a: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    lut: torch.Tensor | None,
+    c: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, int],
+    codec: str,
+) -> None:
+    """`invoke_block_moe_kernel` for one routed row per program.
+
+    Same arguments, except that `sorted_token_ids` / `expert_ids` come from
+    `moe_align_block_size` with `block_size=1`: one entry per routed row and no
+    padding, so `num_tokens_post_padded` is not needed (the grid is one program
+    per row and padding rows store nothing).
+    """
+    N = qweight.size(1)
+    _moe_gemv_kernel[(expert_ids.size(0), triton.cdiv(N, config["BN"]))](
+        a, qweight, scales, lut, c, topk_weights, sorted_token_ids, expert_ids,
+        N, a.size(1), a.size(0) * top_k, a.stride(0), qweight.stride(0),
+        qweight.stride(1), scales.stride(0), scales.stride(1), c.stride(-2),
+        top_k=top_k, MUL_ROUTED_WEIGHT=mul_routed_weight,
+        CODEC=_CODEC_ID[codec], BN=config["BN"], BK=config["BK"],
+        num_warps=config["num_warps"], num_stages=config["num_stages"],
+    )  # fmt: skip
+
+
 def moe_config(M: int, E: int, top_k: int) -> dict[str, int]:
     """Tile sizes for `invoke_block_moe_kernel`, from tokens per expert."""
     per_expert = M * top_k / E
-    bm = next((b for b in (16, 32, 64) if per_expert <= b), 128)
+    if per_expert < 1:
+        # Decode: widen N and deepen K instead of pipelining.
+        bm, bn, bk = 64, 32, 256
+    elif per_expert < 64:
+        bm, bn, bk = 64, 128, 64
+    else:
+        # One 128-row tile per expert avoids decoding its weights twice.
+        bm, bn, bk = 128, 128, 64
     # BN * BK <= 8192 keeps every tile under 60 KB of shared memory on SM80-SM120
-    # and spill-free on SM90.
+    # and spill-free on SM90. Single-stage wins on H200 at both extremes.
     return {
         "BLOCK_SIZE_M": bm,
-        "BN": 128 if bm == 128 else 64,
-        "BK": 128 if bm <= 32 else 64,
-        "num_warps": 8 if bm == 128 else 4,
-        "num_stages": 2,
+        "BN": bn,
+        "BK": bk,
+        "num_warps": 4,
+        "num_stages": 1,
     }
 
 
