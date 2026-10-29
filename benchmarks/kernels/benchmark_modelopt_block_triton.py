@@ -80,8 +80,13 @@ def try_time(fn, ref):
 
 
 def linear_sweep(M, K):
+    # Odd splits too: shared_down has 5376 = 21 * 256 steps, so only 3 and 7 fit.
     for bn, bk, split, warps, stages in itertools.product(
-        (8, 16, 32, 64, 128), (64, 128, 256), (1, 2, 4, 8, 16), (1, 2, 4, 8), (1, 2, 3)
+        (8, 16, 32, 64, 128),
+        (64, 128, 256),
+        (1, 2, 3, 4, 7, 8, 16),
+        (1, 2, 4, 8),
+        (1, 2, 3),
     ):
         if K % (split * bk):
             continue
@@ -156,6 +161,7 @@ def bench_moe(args, rows):
             moe.ModelOptBlockTritonExperts(moe_config, quant_config, "iq2_xxs", lut),
         )
         default_config = moe.moe_config
+        default_gemv = moe.moe_gemv_config
         gen = torch.Generator(device="cuda").manual_seed(0)
         for M in args.m or MOE_M:
             x = torch.randn(M, 1024, dtype=torch.bfloat16)
@@ -171,23 +177,33 @@ def bench_moe(args, rows):
                 fused_experts, x, w1, w2, topk_weights, topk_ids, activation=relu2
             )
             ref = bf16()
-            cfg = default_config(M, E, 9)
-            candidates = [cfg]
+            dot_cfg = default_config(M, E, 9)
+            gemv_cfg = default_gemv(M, E, 9, "iq2_xxs")
+            candidates = [(None, gemv_cfg) if gemv_cfg else (dot_cfg, None)]
             if args.sweep:
                 candidates += [
-                    {"BLOCK_SIZE_M": bm, "BN": bn, "BK": bk, "num_warps": wp,
-                     "num_stages": st}
+                    ({"BLOCK_SIZE_M": bm, "BN": bn, "BK": bk, "num_warps": wp,
+                      "num_stages": st}, None)
                     for bm, bn, bk, wp, st in itertools.product(
                         (16, 32, 64, 128), (32, 64, 128), (64, 128, 256), (4, 8),
                         (1, 2, 3),
                     )
                 ]  # fmt: skip
+                candidates += [
+                    (None, {"BN": bn, "BK": bk, "num_warps": wp, "num_stages": st})
+                    for bn, bk, wp, st in itertools.product(
+                        (8, 16, 32, 64), (64, 128, 256), (1, 2, 4, 8), (1, 2)
+                    )
+                ]  # fmt: skip
             timed = []
-            for c in candidates:
-                moe.moe_config = lambda *_, c=c: c
+            fallback = default_config(M, E, 9)
+            for dot_c, gemv_c in candidates:
+                moe.moe_config = lambda *_, c=dot_c or fallback: c
+                moe.moe_gemv_config = lambda *_, c=gemv_c: c
                 if (us := try_time(ours, ref)) is not None:
-                    timed.append((us, c))
+                    timed.append((us, gemv_c or {**dot_c, "gemv": False}))
             moe.moe_config = default_config
+            moe.moe_gemv_config = default_gemv
             active = topk_ids.unique().numel()
             nbytes = active * 2 * inter * 1024 * 66 / 256 + 4 * M * 1024
             flops = 2 * M * 9 * 2 * inter * 1024

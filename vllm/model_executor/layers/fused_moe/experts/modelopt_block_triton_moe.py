@@ -17,8 +17,10 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
+    invoke_block_moe_gemv_kernel,
     invoke_block_moe_kernel,
     moe_config,
+    moe_gemv_config,
 )
 from vllm.platforms import current_platform
 
@@ -72,7 +74,9 @@ class ModelOptBlockTritonExperts(TritonExperts):
         E, num_tokens, N, K, top_k = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
-        config = moe_config(num_tokens, E, top_k)
+        gemv = moe_gemv_config(num_tokens, E, top_k, self.codec)
+        config = gemv or moe_config(num_tokens, E, top_k)
+        launch = invoke_block_moe_gemv_kernel if gemv else invoke_block_moe_kernel
         cache1 = _resize_cache(workspace2, (num_tokens, top_k, N))
         cache2 = _resize_cache(
             workspace13,
@@ -80,16 +84,16 @@ class ModelOptBlockTritonExperts(TritonExperts):
         )
         cache3 = _resize_cache(workspace2, (num_tokens, top_k, K))
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], E, expert_map
+            topk_ids, 1 if gemv else config["BLOCK_SIZE_M"], E, expert_map
         )
         routing = (sorted_token_ids, expert_ids, num_tokens_post_padded)
 
-        invoke_block_moe_kernel(
+        launch(
             hidden_states, w1, self.w1_scale, self.lut, cache1, None, *routing,
             False, top_k, config, self.codec,
         )  # fmt: skip
         self.activation(activation, cache2, cache1.view(-1, N))
-        invoke_block_moe_kernel(
+        launch(
             cache2, w2, self.w2_scale, self.lut, cache3, topk_weights, *routing,
             not apply_router_weight_on_input, 1, config, self.codec,
         )  # fmt: skip

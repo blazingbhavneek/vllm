@@ -15,6 +15,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
 )
+from vllm.model_executor.layers.fused_moe.experts import modelopt_block_triton_moe as moe_mod
 from vllm.model_executor.layers.fused_moe.experts.modelopt_block_triton_moe import (
     ModelOptBlockTritonExperts,
 )
@@ -23,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
 )
 from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
     _IQ2XXS_GRID,
+    _linear_config,
     dequantize_blocks,
     iq2_lut,
     launch_linear,
@@ -140,6 +142,14 @@ def test_linear_matches_reference(codec, M):
     assert_close_to_cublas(linear(x, raw, codec), x, ref_decode(raw, codec))
 
 
+def test_linear_odd_k_steps():
+    """An odd K step count splits too: shared_down has 5376 = 21 * 256 steps."""
+    assert _linear_config(1, 4096, 5376, "iq2_xxs", 132, 227 * 1024)["SPLIT"] == 7
+    raw = make_raw((136,), 5376, "iq2_xxs", seed=3)
+    x = torch.randn(1, 5376, device="cuda", dtype=torch.bfloat16)
+    assert_close_to_cublas(linear(x, raw, "iq2_xxs"), x, ref_decode(raw, "iq2_xxs"))
+
+
 @pytest.mark.parametrize("M", [1, 17])
 def test_linear_offset_view(M):
     """Unaligned activation pointers take the same kernels and stay correct."""
@@ -233,11 +243,18 @@ def assert_moe_close_to_bf16(out, *args):
 
     Over random inputs the ratio has a median of ~0.9 and a tail to ~1.6; a
     routing or weighting bug is orders of magnitude off.
+
+    Plus one bf16 ulp of the output scale: the fused contract keeps c1/c2 in the
+    model dtype, so anything under a ulp of the largest output cannot show up in
+    the result. Real Bolt expert weights need this slack at decode sizes (2-4x
+    the bare 2x bar at M=4) while matching a torch simulation of the same bf16
+    buffer chain exactly, so the slack is the buffers, not the kernels.
     """
     want = ref_moe(*args, torch.float64)
     bf16 = ref_moe(*args, torch.bfloat16)
     ours = (out.double() - want).abs().max()
-    assert ours <= 2 * (bf16 - want).abs().max() + 1e-6, ours
+    ulp = want.abs().max().double() * 2**-8
+    assert ours <= 2 * (bf16 - want).abs().max() + ulp + 1e-6, ours
 
 
 def make_moe(codec, activation, E=16, K=1024, inter=512, top_k=2):
@@ -292,17 +309,46 @@ def test_moe_matches_reference(codec, activation, top_k, M, workspace_init):
     assert_moe_close_to_bf16(got, x, w1, w2, topk_weights, topk_ids, activation)
 
 
-def test_moe_cuda_graph_new_routing(workspace_init):
+@pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
+@pytest.mark.parametrize("M", [1, 8])
+def test_moe_paths_agree(codec, M, workspace_init, monkeypatch):
+    """Both MoE paths on the same routing, not only both against the reference.
+
+    The runtime gate picks one per call, so the two must agree to the rounding
+    of the bf16 output: a path-only bug can still hide under the loose
+    reference bar in `test_moe_matches_reference`.
+    """
+    run, w1, w2 = make_moe(codec, MoEActivation.RELU2_NO_MUL, top_k=9)
+    x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
+    topk_weights, topk_ids = make_routing(M, 16, 9)
+    assert moe_mod.moe_gemv_config(M, 16, 9, codec) is not None  # gate is on
+    gemv = run(x, topk_weights, topk_ids)
+    monkeypatch.setattr(moe_mod, "moe_gemv_config", lambda *a: None)
+    dot = run(x, topk_weights, topk_ids)
+    # Same products, different fp32 tile order, and the output is a bf16 sum of
+    # cancelling terms, so compare in the max-abs norm the reference bar uses:
+    # the gap must stay under what an unfused bf16 MoE already shows (measured
+    # at 40-50% of it, i.e. one bf16 ulp of the output scale). Relative error
+    # is useless here - near-zero outputs reach 6x.
+    args = (x, w1, w2, topk_weights, topk_ids, MoEActivation.RELU2_NO_MUL)
+    want = ref_moe(*args, torch.float64)
+    bar = 2 * (ref_moe(*args, torch.bfloat16) - want).abs().max()
+    gap = (gemv.double() - dot.double()).abs().max()
+    assert gap <= bar + 1e-6, (gap.item(), bar.item())
+
+
+@pytest.mark.parametrize("M", [1, 8, 16])  # 1, 8 -> GEMV path; 16 -> the tl.dot path
+def test_moe_cuda_graph_new_routing(M, workspace_init):
     """Routing changes every step when serving; replays must follow it."""
     run, w1, w2 = make_moe("iq2_xxs", MoEActivation.RELU2_NO_MUL, top_k=9)
-    x = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
-    topk_weights, topk_ids = make_routing(8, 16, 9)
+    x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
+    topk_weights, topk_ids = make_routing(M, 16, 9)
     run(x, topk_weights, topk_ids)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = run(x, topk_weights, topk_ids)
     for _ in range(2):
-        new_weights, new_ids = make_routing(8, 16, 9)
+        new_weights, new_ids = make_routing(M, 16, 9)
         x.copy_(torch.randn_like(x))
         topk_weights.copy_(new_weights)
         topk_ids.copy_(new_ids)
