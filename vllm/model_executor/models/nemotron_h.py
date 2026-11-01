@@ -249,6 +249,9 @@ class NemotronHMoE(nn.Module):
             routed_output_transform=self.fc2_latent_proj,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=True,
+            # The decoder layers don't compensate for the FP16 shared-output
+            # division, so scale the routed output in every dtype.
+            runner_args={"fp16_divide_shared_output": False},
             router_logits_dtype=self.gate.out_dtype,
         )
 

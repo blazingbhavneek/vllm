@@ -260,6 +260,7 @@ class MoERunner(MoERunnerInterface):
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
+        fp16_divide_shared_output: bool = True,
     ):
         super().__init__()
         self.moe_config = moe_config
@@ -267,6 +268,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_input_transform = routed_input_transform
         self.routed_output_transform = routed_output_transform
         self.routed_scaling_factor = routed_scaling_factor
+        self.fp16_divide_shared_output = fp16_divide_shared_output
         self.gate = gate
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
@@ -410,10 +412,16 @@ class MoERunner(MoERunnerInterface):
 
         Scale the fused expert output by routed_scaling_factor. For FP16,
         avoid overflow by dividing shared_output by the scale instead
-        (the decoder layer compensates with matching divisions).
+        (the decoder layer compensates with matching divisions). Models
+        whose decoder layers don't compensate set fp16_divide_shared_output
+        to False.
         """
         if self.routed_scaling_factor != 1.0:
-            if fused_output.dtype != torch.float16 or shared_output is None:
+            if (
+                fused_output.dtype != torch.float16
+                or shared_output is None
+                or not self.fp16_divide_shared_output
+            ):
                 fused_output *= self.routed_scaling_factor
             elif shared_output is not None:
                 shared_output *= 1.0 / self.routed_scaling_factor
