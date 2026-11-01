@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 
 import pytest
+import torch
 
 from tests.models.registry import HF_EXAMPLE_MODELS
 from tests.utils import multi_gpu_test
@@ -926,3 +928,96 @@ def test_apc_common_prefix_same_batch(
     outputs = llm.generate(prompts, sampling_params)
     for output in outputs:
         assert "two" in output.outputs[0].text
+
+
+def _init_tiny_nemotron_h_moe(model) -> None:
+    """Give the MoE path, embeddings and lm_head unit-scale weights so the
+    MoE output is comparable to the residual stream."""
+    with torch.no_grad():
+        for i, (name, p) in enumerate(model.named_parameters()):
+            if "norm" in name:
+                p.fill_(1.0)
+            elif "embed_tokens" in name or "experts" in name or "lm_head" in name:
+                g = torch.Generator(device=p.device).manual_seed(i)
+                std = p.shape[-1] ** -0.5
+                if "embed_tokens" in name:
+                    std = 1.0
+                elif "lm_head" in name:
+                    std *= 8  # peaked logits, so FP16/BF16 noise can't flip ties
+                p.copy_(torch.randn(p.shape, generator=g, device=p.device) * std)
+
+
+def test_nemotron_h_moe_fp16_matches_bf16(tmp_path, vllm_runner, monkeypatch) -> None:
+    """FP16 keeps routed_scaling_factor on NemotronH MoE layers.
+
+    In FP16 the MoE runner can divide the shared-expert output by
+    routed_scaling_factor instead of scaling the routed output, relying on
+    the decoder to compensate. NemotronH decoder layers don't, so its FP16
+    MoE output came out routed_scaling_factor times too small.
+    """
+    config = {
+        "architectures": ["NemotronHForCausalLM"],
+        "model_type": "nemotron_h",
+        "torch_dtype": "bfloat16",
+        "vocab_size": 1024,
+        "hidden_size": 256,
+        "hybrid_override_pattern": "M*E",
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "max_position_embeddings": 512,
+        "intermediate_size": 512,
+        "mamba_num_heads": 4,
+        "mamba_head_dim": 64,
+        "ssm_state_size": 64,
+        "n_groups": 1,
+        "conv_kernel": 4,
+        "chunk_size": 128,
+        "expand": 1,
+        "mamba_hidden_act": "silu",
+        "use_conv_bias": True,
+        "use_bias": False,
+        "mlp_bias": False,
+        "mlp_hidden_act": "relu2",
+        "layer_norm_epsilon": 1e-5,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "n_shared_experts": 1,
+        "moe_shared_expert_intermediate_size": 256,
+        "routed_scaling_factor": 5.0,
+        "n_group": 1,
+        "topk_group": 1,
+        "norm_topk_prob": True,
+        "tie_word_embeddings": False,
+        "eos_token_id": 2,
+        "bos_token_id": 1,
+        "pad_token_id": 0,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    prompts = [list(range(3 + i, 40 + 7 * i)) for i in range(3)]
+    params = SamplingParams(temperature=0, max_tokens=8, logprobs=5, ignore_eos=True)
+    outputs = {}
+    for dtype in ("bfloat16", "float16"):
+        with vllm_runner(
+            str(tmp_path),
+            load_format="dummy",
+            dtype=dtype,
+            skip_tokenizer_init=True,
+            max_model_len=256,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            enable_chunked_prefill=True,
+            enforce_eager=True,
+            gpu_memory_utilization=0.3,
+        ) as llm:
+            llm.apply_model(_init_tiny_nemotron_h_moe)
+            outputs[dtype] = llm.generate_w_logprobs(prompts, params)
+    check_logprobs_close(
+        outputs_0_lst=outputs["bfloat16"],
+        outputs_1_lst=outputs["float16"],
+        name_0="bf16",
+        name_1="fp16",
+    )
