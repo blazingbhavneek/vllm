@@ -47,17 +47,17 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
     if not current_platform.is_cuda():
         return
 
+    model = worker.get_model()
+    layers = list(_triton_layers(model))
+    if not layers:
+        return
+
     from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
         moe_align_block_size,
     )
     from vllm.model_executor.layers.quantization import (
         modelopt_block_quant_triton as kernels,
     )
-
-    model = worker.get_model()
-    layers = list(_triton_layers(model))
-    if not layers:
-        return
 
     max_tokens = _warmup_token_counts(worker)
     props = torch.cuda.get_device_properties(worker.device)

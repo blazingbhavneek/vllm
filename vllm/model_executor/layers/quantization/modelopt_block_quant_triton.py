@@ -746,11 +746,11 @@ def moe_gemv_config(M: int, E: int, top_k: int, codec: str) -> dict[str, int] | 
     0.66x at M=32 - those wide one-warp grids stop paying for themselves, so
     above 8 rows `moe_config`'s padded `tl.dot` tiles go back to winning. A
     standalone kernel sweep disagrees (still 2.6x ahead at M=16); it has no
-    other work on the GPU, serving does. On GDDR GPUs the GEMV stays ahead
-    through 64 rows (RTX 5060 Ti: 1.5-2.4x at M=16-64).
+    other work on the GPU, serving does. GDDR agrees: on an L40S the sweep
+    keeps GEMV ahead through M=128, yet serving with 8 rows instead of 64 is
+    4% faster at concurrency 16 and 7% at 32.
     """
-    max_rows = 8 if _is_hbm(torch.accelerator.current_device_index()) else 64
-    if max_rows < M:
+    if M > 8:
         return None
     bn, bk, warps = (8, 256, 1) if codec == "iq2_xxs" else (32, 256, 4)
     return {"BN": bn, "BK": bk, "num_warps": warps, "num_stages": 2}
