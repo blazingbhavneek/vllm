@@ -622,8 +622,10 @@ def dequantize_blocks(
 # GEMM decodes W once per M tile. Capping the copy at 128 MiB keeps lm_head on
 # the fused GEMM. The copy is a write and a read of 2 bytes per weight, so the
 # crossover tracks memory bandwidth: (HBM, GDDR) values were measured on an
-# H200 and an RTX 5060 Ti.
-DEQUANT_MIN_M = {"iq2_xxs": (8, 128), "q8_0": (64, 256)}
+# H200 and an RTX 5060 Ti. On GDDR the fused IQ2_XXS GEMM doubles in cost past
+# one 64-row M tile while dequant + cuBLAS barely moves, so IQ2 switches at 65
+# (5060 Ti, RTX 3090 and L40S agree: dequant 1.5-2.1x faster at M=96).
+DEQUANT_MIN_M = {"iq2_xxs": (8, 65), "q8_0": (64, 256)}
 DEQUANT_MAX_NUMEL = 1 << 26
 
 
