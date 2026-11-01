@@ -1666,14 +1666,7 @@ def test_modelopt_block_quant_backend_selection(
                 assert build().use_triton == (expected == "triton")
 
 
-@_requires_sm80
-def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
-    """IQ2_XXS on traced attention and routed experts, Q8_0 on shared experts,
-    latent projections, lm_head and embeddings: torch.compile + CUDA graphs
-    agree with eager."""
-    from tests.models.utils import check_logprobs_close
-    from vllm import SamplingParams
-
+def _make_tiny_modelopt_block_model(tmp_path):
     def recipe(codec):
         return {
             "quant_algo": codec.upper(),
@@ -1752,12 +1745,36 @@ def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
                     g = torch.Generator(device=p.device).manual_seed(len(name))
                     p.copy_(torch.rand(p.shape, device=p.device, generator=g) * 1e-3)
                     p.add_(2e-4)
+            from vllm.model_executor.layers.quantization import (
+                modelopt_block_quant_triton as block_kernels,
+            )
+
+            for module in model.modules():
+                if getattr(module, "weight_bf16", None) is not None:
+                    module.weight_bf16.copy_(
+                        block_kernels.dequantize_blocks(
+                            module.weight,
+                            module.weight_scale,
+                            module.iq2_lut,
+                            module.quant_method.codec,
+                        )
+                    )
         return sum(
             getattr(m.quant_method, "use_triton", False)
             for m in model.modules()
             if hasattr(m, "quant_method")
         )
 
+    return finite_scales
+
+
+@_requires_sm80
+def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
+    """Compiled and eager block-quantized Nemotron-H agree in logprobs."""
+    from tests.models.utils import check_logprobs_close
+    from vllm import SamplingParams
+
+    finite_scales = _make_tiny_modelopt_block_model(tmp_path)
     prompts = [list(range(3 + i, 40 + 7 * i)) for i in range(3)]
     params = SamplingParams(temperature=0, max_tokens=12, logprobs=5, ignore_eos=True)
     outputs = []
@@ -1784,3 +1801,46 @@ def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
         name_0="eager",
         name_1="compiled",
     )
+
+
+@_requires_sm80
+def test_modelopt_block_triton_dense_cache_matches_uncached(tmp_path, vllm_runner):
+    """Loaded BF16 caches preserve outputs of the packed checkpoint exactly.
+
+    Compare on the same model and execution mode so dummy-model sensitivity
+    to eager versus compiled Mamba execution does not confound cache parity.
+    """
+    from vllm import SamplingParams
+
+    finite_scales = _make_tiny_modelopt_block_model(tmp_path)
+    prompts = [list(range(3 + i, 30 + 3 * i)) for i in range(8)]
+    params = SamplingParams(temperature=0, max_tokens=12, logprobs=5, ignore_eos=True)
+
+    def clear_caches(model):
+        count = 0
+        for module in model.modules():
+            if getattr(module, "weight_bf16", None) is not None:
+                module.weight_bf16 = None
+                count += 1
+        return count
+
+    with vllm_runner(
+        str(tmp_path),
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        max_model_len=256,
+        max_num_seqs=8,
+        max_num_batched_tokens=256,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.2,
+        linear_backend="triton",
+        moe_backend="triton",
+        kernel_config={"modelopt_iq2_dense_cache": True},
+        enforce_eager=True,
+    ) as llm:
+        assert llm.apply_model(finite_scales) == [9]
+        cached = llm.generate_w_logprobs(prompts, params)
+        assert llm.apply_model(clear_caches)[0] > 0
+        uncached = llm.generate_w_logprobs(prompts, params)
+    assert cached == uncached

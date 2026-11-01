@@ -15,7 +15,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
 )
-from vllm.model_executor.layers.fused_moe.experts import modelopt_block_triton_moe as moe_mod
+from vllm.model_executor.layers.fused_moe.experts import (
+    modelopt_block_triton_moe as moe_mod,
+)
 from vllm.model_executor.layers.fused_moe.experts.modelopt_block_triton_moe import (
     ModelOptBlockTritonExperts,
 )
@@ -150,6 +152,37 @@ def test_linear_odd_k_steps():
     assert_close_to_cublas(linear(x, raw, "iq2_xxs"), x, ref_decode(raw, "iq2_xxs"))
 
 
+@pytest.mark.parametrize("N,K", [(256, 4096), (1024, 4096), (4096, 4096), (4096, 1024)])
+@pytest.mark.parametrize("extreme", [False, True])
+def test_q8_decode_projection_single_reduction(N, K, extreme):
+    """Single-row Q8 projections keep cuBLAS-level error through graph replay."""
+    raw = make_raw((N,), K, "q8_0", seed=31, extreme=extreme)
+    x = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    want = ref_decode(raw, "q8_0")
+    linear(x, raw, "q8_0")
+    graph = torch.cuda.CUDAGraph()
+    qw, scales = repack_blocks(raw, "q8_0")
+    with torch.cuda.graph(graph):
+        out = torch.ops.vllm.modelopt_block_linear(x, qw, scales, None, "q8_0")
+    graph.replay()
+    assert_close_to_cublas(out, x, want)
+
+
+@pytest.mark.parametrize("M", [1, 4, 7, 8, 16, 65, 128])
+def test_iq2_dense_cache_preserves_dispatch_and_outputs(M):
+    """Reuse exact BF16 weights only where the uncached op dequantizes them."""
+    raw = make_raw((136,), 5376, "iq2_xxs", seed=29)
+    qw, scales = repack_blocks(raw, "iq2_xxs")
+    lut = iq2_lut(raw.device)
+    cached = dequantize_blocks(qw, scales, lut, "iq2_xxs")
+    if M < 8:
+        cached.fill_(float("nan"))
+    x = torch.randn(M, 5376, device="cuda", dtype=torch.bfloat16)
+    want = torch.ops.vllm.modelopt_block_linear(x, qw, scales, lut, "iq2_xxs")
+    got = torch.ops.vllm.modelopt_block_linear(x, qw, scales, lut, "iq2_xxs", cached)
+    assert torch.equal(got, want)
+
+
 @pytest.mark.parametrize("M", [1, 17])
 def test_linear_offset_view(M):
     """Unaligned activation pointers take the same kernels and stay correct."""
@@ -162,7 +195,7 @@ def test_linear_offset_view(M):
 
 def test_linear_int64_offsets():
     """M * N > 2**31 (lm_head with large prefills) must not overflow offsets."""
-    if torch.cuda.mem_get_info()[0] < 12 << 30:
+    if torch.accelerator.get_memory_info()[0] < 12 << 30:
         pytest.skip("needs 12 GiB of free GPU memory")
     M, N, K = 16400, 131072, 4096
     raw = make_raw((N,), K, "q8_0", seed=4)
@@ -179,7 +212,7 @@ def _kernel_names(fn):
         activities=[torch.profiler.ProfilerActivity.CUDA]
     ) as prof:
         fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     return {e.key for e in prof.key_averages() if "_kernel" in e.key}
 
 
@@ -204,21 +237,25 @@ def test_linear_compile_does_not_freeze_dispatch():
     assert_close_to_cublas(compiled(x), x, ref_decode(raw, "iq2_xxs"))
 
 
+@pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("M", [1, 4, 17])
-def test_linear_cuda_graph_replay(M):
+def test_linear_cuda_graph_replay(M, cached):
     raw = make_raw((520,), 1024, "iq2_xxs", seed=6)
     qweight, scales = repack_blocks(raw, "iq2_xxs")
     lut = iq2_lut(raw.device)
+    weight = dequantize_blocks(qweight, scales, lut, "iq2_xxs") if cached else None
     x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
-    torch.ops.vllm.modelopt_block_linear(x, qweight, scales, lut, "iq2_xxs")
+    torch.ops.vllm.modelopt_block_linear(x, qweight, scales, lut, "iq2_xxs", weight)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        out = torch.ops.vllm.modelopt_block_linear(x, qweight, scales, lut, "iq2_xxs")
+        out = torch.ops.vllm.modelopt_block_linear(
+            x, qweight, scales, lut, "iq2_xxs", weight
+        )
     for _ in range(2):
         x.copy_(torch.randn_like(x))
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.accelerator.memory_allocated()
         graph.replay()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.accelerator.memory_allocated() == allocated
         assert_close_to_cublas(out, x, ref_decode(raw, "iq2_xxs"))
 
 
@@ -238,7 +275,7 @@ def ref_moe(x, w1, w2, topk_weights, topk_ids, activation, dtype):
     return out
 
 
-def assert_moe_close_to_bf16(out, *args):
+def assert_moe_close_to_bf16(out, x, w1, w2, topk_weights, topk_ids, activation):
     """Our error vs the exact MoE must be within 2x of an unfused bf16 MoE's.
 
     Over random inputs the ratio has a median of ~0.9 and a tail to ~1.6; a
@@ -250,8 +287,8 @@ def assert_moe_close_to_bf16(out, *args):
     the bare 2x bar at M=4) while matching a torch simulation of the same bf16
     buffer chain exactly, so the slack is the buffers, not the kernels.
     """
-    want = ref_moe(*args, torch.float64)
-    bf16 = ref_moe(*args, torch.bfloat16)
+    want = ref_moe(x, w1, w2, topk_weights, topk_ids, activation, torch.float64)
+    bf16 = ref_moe(x, w1, w2, topk_weights, topk_ids, activation, torch.bfloat16)
     ours = (out.double() - want).abs().max()
     ulp = want.abs().max().double() * 2**-8
     assert ours <= 2 * (bf16 - want).abs().max() + ulp + 1e-6, ours
@@ -295,6 +332,59 @@ def make_routing(M, E, top_k):
     topk_ids = torch.rand(M, E, device="cuda").topk(top_k, dim=-1).indices
     topk_weights = torch.rand(M, top_k, device="cuda").softmax(dim=-1)
     return topk_weights, topk_ids.to(torch.int32)
+
+
+@pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
+@pytest.mark.parametrize("M", [1, 8])
+@pytest.mark.parametrize("top_k", [1, 9])
+@pytest.mark.parametrize("fused_relu2", [False, True])
+def test_moe_gemv_direct_routing_matches_aligned(codec, M, top_k, fused_relu2):
+    """Skipping token sorting preserves every routed slot, including repeats."""
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
+        invoke_block_moe_gemv_kernel,
+        moe_gemv_config,
+    )
+
+    E, N, K = 16, 520, 1024
+    raw = make_raw((E, N), K, codec, seed=23)
+    qw, scales = repack_blocks(raw, codec)
+    lut = iq2_lut(raw.device) if codec == "iq2_xxs" else None
+    # Repeated experts and descending IDs make identity/sorted-index confusion
+    # observable. top_k=1 exercises GEMM2's already expanded input rows.
+    ids = (torch.arange(M * 9, device="cuda") % 5).flip(0).int().view(M, 9)
+    weights = torch.rand((M, 9), device="cuda")
+    x = torch.randn(M * 9 // top_k, K, device="cuda", dtype=torch.bfloat16)
+    want = torch.empty((M, 9, N), device="cuda", dtype=torch.bfloat16)
+    got = torch.empty_like(want)
+    cfg = moe_gemv_config(M, E, 9, codec)
+    routing = moe_align_block_size(ids, 1, E, None)
+    for out, route, relu2 in (
+        (want, routing, False),
+        (got, (None, ids, None), fused_relu2),
+    ):
+        sorted_ids, expert_ids, post_padded = route
+        invoke_block_moe_gemv_kernel(
+            x,
+            qw,
+            scales,
+            lut,
+            out,
+            weights,
+            sorted_ids,
+            expert_ids,
+            post_padded,
+            True,
+            top_k,
+            cfg,
+            codec,
+            apply_relu2=relu2,
+        )
+    if fused_relu2:
+        want = torch.square(torch.relu(want))
+    assert torch.equal(got, want)
 
 
 @pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
@@ -352,9 +442,9 @@ def test_moe_cuda_graph_new_routing(M, workspace_init):
         x.copy_(torch.randn_like(x))
         topk_weights.copy_(new_weights)
         topk_ids.copy_(new_ids)
-        allocated = torch.cuda.memory_allocated()
+        allocated = torch.accelerator.memory_allocated()
         graph.replay()
-        assert torch.cuda.memory_allocated() == allocated
+        assert torch.accelerator.memory_allocated() == allocated
         assert_moe_close_to_bf16(
             out, x, w1, w2, topk_weights, topk_ids, MoEActivation.RELU2_NO_MUL
         )
@@ -367,3 +457,27 @@ def test_q8_embedding_exact(id_dtype):
     ids = torch.tensor([5, 5, 299, 0, 17, 3, 5], device="cuda", dtype=id_dtype)
     out = torch.ops.vllm.modelopt_block_embedding(ids, qweight, scales)
     assert torch.equal(out, ref_decode(raw[ids.long()], "q8_0").bfloat16())
+
+
+@pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
+@pytest.mark.parametrize("M", [16, 32])
+@pytest.mark.parametrize("activation", [MoEActivation.RELU2_NO_MUL, MoEActivation.SILU])
+def test_moe_singleton_tiles_follow_routing_under_graph(
+    codec, M, activation, workspace_init
+):
+    """A graph follows singleton and shared-expert routes without dropping rows."""
+    run, w1, w2 = make_moe(codec, activation, E=128, top_k=2)
+    x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand((M, 2), device="cuda").softmax(-1)
+    ids = torch.arange(M * 2, device="cuda", dtype=torch.int32).view(M, 2)
+    run(x, weights, ids)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run(x, weights, ids)
+    for routing in (
+        torch.arange(2, device="cuda", dtype=torch.int32).expand(M, 2),
+        torch.arange(M * 2, device="cuda", dtype=torch.int32).view(M, 2).flip(0),
+    ):
+        ids.copy_(routing)
+        graph.replay()
+        assert_moe_close_to_bf16(out, x, w1, w2, weights, ids, activation)

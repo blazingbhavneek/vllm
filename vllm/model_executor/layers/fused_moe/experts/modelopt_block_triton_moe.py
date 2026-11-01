@@ -83,16 +83,23 @@ class ModelOptBlockTritonExperts(TritonExperts):
             (num_tokens * top_k, self.adjust_N_for_activation(N, activation)),
         )
         cache3 = _resize_cache(workspace2, (num_tokens, top_k, K))
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, 1 if gemv else config["BLOCK_SIZE_M"], E, expert_map
-        )
-        routing = (sorted_token_ids, expert_ids, num_tokens_post_padded)
+        fused_relu2 = gemv is not None and activation == MoEActivation.RELU2_NO_MUL
+        if gemv and expert_map is None:
+            # Each GEMV CTA owns one routed row, so sorting cannot share work.
+            routing = (None, topk_ids.contiguous(), None)
+        else:
+            routing = moe_align_block_size(
+                topk_ids, 1 if gemv else config["BLOCK_SIZE_M"], E, expert_map
+            )
 
         launch(
-            hidden_states, w1, self.w1_scale, self.lut, cache1, None, *routing,
+            hidden_states, w1, self.w1_scale, self.lut,
+            cache2 if fused_relu2 else cache1, None, *routing,
             False, top_k, config, self.codec,
+            **({"apply_relu2": fused_relu2} if gemv else {}),
         )  # fmt: skip
-        self.activation(activation, cache2, cache1.view(-1, N))
+        if not fused_relu2:
+            self.activation(activation, cache2, cache1.view(-1, N))
         launch(
             cache2, w2, self.w2_scale, self.lut, cache3, topk_weights, *routing,
             not apply_router_weight_on_input, 1, config, self.codec,

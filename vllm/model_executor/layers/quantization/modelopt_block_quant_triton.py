@@ -321,6 +321,7 @@ def _moe_gemm_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    SINGLETON_GEMV: tl.constexpr = True,
 ):
     """`fused_moe_kernel` with B decoded from packed blocks of expert e."""
     pid = tl.program_id(0)
@@ -337,6 +338,43 @@ def _moe_gemm_kernel(
     a_rows = a_ptr + (offs_token // top_k)[:, None] * stride_am
     qw_ptr += e * stride_qe
     sc_ptr += e * stride_se
+    if tl.constexpr(SINGLETON_GEMV and BM == 64 and BN == 32 and BK == 128):
+        # Sparse expert tiles avoid multiplying 63 padding rows by decoded weights.
+        first = tl.load(sorted_token_ids_ptr + pid_m * BM).to(tl.int64)
+        second = tl.load(sorted_token_ids_ptr + pid_m * BM + 1)
+        if second >= num_valid_tokens:
+            row = a_ptr + (first // top_k) * stride_am
+            single = tl.zeros((BN,), dtype=tl.float32)
+            for k0 in range(0, K, BK):
+                # Match the tensor-core path's BF16 weight rounding.
+                single_w = (
+                    _decode_tile(
+                        qw_ptr,
+                        sc_ptr,
+                        lut_ptr,
+                        offs_n,
+                        n_mask,
+                        k0,
+                        stride_qn,
+                        stride_sn,
+                        CODEC,
+                        True,
+                        BN,
+                        BK,
+                    )
+                    .to(tl.bfloat16)
+                    .to(tl.float32)
+                )
+                single_x = tl.load(row + k0 + tl.arange(0, BK)).to(tl.float32)
+                single += tl.sum(single_w * single_x[None, :], axis=1)
+            if MUL_ROUTED_WEIGHT:
+                single *= tl.load(topk_weights_ptr + first).to(tl.float32)
+            tl.store(
+                c_ptr + first * stride_cm + offs_n,
+                single.to(c_ptr.dtype.element_ty),
+                n_mask,
+            )
+            return
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K, BK):
         a = tl.load(
@@ -381,8 +419,10 @@ def _moe_gemv_kernel(
     top_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     CODEC: tl.constexpr,
+    DIRECT_ROUTING: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    APPLY_RELU2: tl.constexpr = False,
 ):
     """One routed row per program: c[slot] = a[slot // top_k] @ W[e]^T.
 
@@ -391,7 +431,10 @@ def _moe_gemv_kernel(
     beats the 2-bit codes used by `_moe_gemm_kernel`'s `tl.dot` layout.
     """
     slot = tl.program_id(0)
-    offs_token = tl.load(sorted_token_ids_ptr + slot).to(tl.int64)
+    if DIRECT_ROUTING:
+        offs_token = slot.to(tl.int64)
+    else:
+        offs_token = tl.load(sorted_token_ids_ptr + slot).to(tl.int64)
     valid = offs_token < num_valid_tokens
     # A padding slot reads row 0 and an expert that exists; only its store is off.
     row = tl.where(valid, offs_token, 0) // top_k
@@ -412,6 +455,10 @@ def _moe_gemv_kernel(
     if MUL_ROUTED_WEIGHT:
         weight = tl.load(topk_weights_ptr + offs_token, mask=valid, other=0.0)
         acc *= weight.to(tl.float32)
+    if APPLY_RELU2:
+        # Preserve the intermediate stored by the unfused first GEMM.
+        value = tl.maximum(acc.to(c_ptr.dtype.element_ty).to(tl.float32), 0.0)
+        acc = value * value
     tl.store(
         c_ptr + offs_token * stride_cm + offs_n,
         acc.to(c_ptr.dtype.element_ty),
@@ -449,8 +496,23 @@ def _q8_embedding_kernel(
 
 
 def _linear_config(
-    M: int, N: int, K: int, codec: str, num_sms: int, smem: int
+    M: int, N: int, K: int, codec: str, num_sms: int, smem: int, major: int = 0
 ) -> dict[str, int]:
+    if (
+        major == 9
+        and codec == "q8_0"
+        and M == 1
+        and (N, K) in ((256, 4096), (1024, 4096), (4096, 4096), (4096, 1024))
+    ):
+        # Hopper decode: wider K tiles avoid a separate split-K reduction.
+        return {
+            "BM": 1,
+            "BN": 4,
+            "BK": min(K, 1024) if N == 4096 else K,
+            "SPLIT": 1,
+            "num_warps": 4,
+            "num_stages": 1,
+        }
     if M == 1 or (codec == "iq2_xxs" and M <= 4):
         # GEMV; for IQ2 it beats tl.dot up to 4 rows.
         bm = triton.next_power_of_2(M)
@@ -564,6 +626,7 @@ def _modelopt_block_linear(
     scales: torch.Tensor,
     lut: torch.Tensor | None,
     codec: str,
+    weight_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed block GEMM; picks the kernel from M inside the op.
 
@@ -573,6 +636,7 @@ def _modelopt_block_linear(
         scales: fp16 [N, K / block_size].
         lut: `iq2_lut` for IQ2_XXS, None for Q8_0.
         codec: "iq2_xxs" or "q8_0".
+        weight_bf16: Optional cached dequantized weights for the BF16 GEMM path.
 
     Returns:
         bf16 [M, N].
@@ -582,7 +646,12 @@ def _modelopt_block_linear(
     if M == 0:
         return x.new_empty((0, qweight.shape[0]))
     if DEQUANT_MIN_M[codec] <= M and qweight.shape[0] * K <= DEQUANT_MAX_NUMEL:
-        return x @ dequantize_blocks(qweight, scales, lut, codec).T
+        weight = (
+            weight_bf16
+            if weight_bf16 is not None
+            else dequantize_blocks(qweight, scales, lut, codec)
+        )
+        return x @ weight.T
     if x.stride(1) != 1:
         x = x.contiguous()
     props = torch.cuda.get_device_properties(x.device)
@@ -593,6 +662,7 @@ def _modelopt_block_linear(
         codec,
         props.multi_processor_count,
         props.shared_memory_per_block_optin,
+        props.major,
     )
     return launch_linear(x, qweight, scales, lut, codec, cfg)
 
@@ -603,6 +673,7 @@ def _modelopt_block_linear_fake(
     scales: torch.Tensor,
     lut: torch.Tensor | None,
     codec: str,
+    weight_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], qweight.shape[0]))
 
@@ -640,9 +711,7 @@ direct_register_custom_op(
 )
 
 
-def moe_gemv_config(
-    M: int, E: int, top_k: int, codec: str
-) -> dict[str, int] | None:
+def moe_gemv_config(M: int, E: int, top_k: int, codec: str) -> dict[str, int] | None:
     """Tiles for the decode path, or None when `moe_config`'s tiles win.
 
     One program per routed row: no `moe_align_block_size` padding and no
@@ -666,13 +735,14 @@ def invoke_block_moe_gemv_kernel(
     lut: torch.Tensor | None,
     c: torch.Tensor,
     topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
     mul_routed_weight: bool,
     top_k: int,
     config: dict[str, int],
     codec: str,
+    apply_relu2: bool = False,
 ) -> None:
     """`invoke_block_moe_kernel` for one routed row per program.
 
@@ -682,11 +752,14 @@ def invoke_block_moe_gemv_kernel(
     per row and padding rows store nothing).
     """
     N = qweight.size(1)
-    _moe_gemv_kernel[(expert_ids.size(0), triton.cdiv(N, config["BN"]))](
+    slots = expert_ids.numel() if sorted_token_ids is None else expert_ids.size(0)
+    _moe_gemv_kernel[(slots, triton.cdiv(N, config["BN"]))](
         a, qweight, scales, lut, c, topk_weights, sorted_token_ids, expert_ids,
         N, a.size(1), a.size(0) * top_k, a.stride(0), qweight.stride(0),
         qweight.stride(1), scales.stride(0), scales.stride(1), c.stride(-2),
         top_k=top_k, MUL_ROUTED_WEIGHT=mul_routed_weight,
+        DIRECT_ROUTING=sorted_token_ids is None,
+        APPLY_RELU2=apply_relu2,
         CODEC=_CODEC_ID[codec], BN=config["BN"], BK=config["BK"],
         num_warps=config["num_warps"], num_stages=config["num_stages"],
     )  # fmt: skip
@@ -697,14 +770,14 @@ def moe_config(M: int, E: int, top_k: int) -> dict[str, int]:
     per_expert = M * top_k / E
     if per_expert < 1:
         # Decode: widen N and deepen K instead of pipelining.
-        bm, bn, bk = 64, 32, 256
+        bm, bn, bk = 64, 32, 128
     elif per_expert < 64:
         bm, bn, bk = 64, 128, 64
     else:
         # One 128-row tile per expert avoids decoding its weights twice.
         bm, bn, bk = 128, 128, 64
-    # BN * BK <= 8192 keeps every tile under 60 KB of shared memory on SM80-SM120
-    # and spill-free on SM90. Single-stage wins on H200 at both extremes.
+    # BN * BK <= 8192 keeps every tile under 60 KB of shared memory on SM80-SM120.
+    # H200 profiling favors one stage and four warps, including BM128.
     return {
         "BLOCK_SIZE_M": bm,
         "BN": bn,
@@ -757,6 +830,7 @@ def invoke_block_moe_kernel(
         num_tokens_post_padded, N, a.size(1), em, a.size(0) * top_k, a.stride(0),
         qweight.stride(0), qweight.stride(1), scales.stride(0), scales.stride(1),
         c.stride(-2), top_k=top_k, MUL_ROUTED_WEIGHT=mul_routed_weight,
+        SINGLETON_GEMV=config.get("SINGLETON_GEMV", True),
         CODEC=_CODEC_ID[codec], BM=bm, BN=config["BN"], BK=config["BK"],
         num_warps=config["num_warps"], num_stages=config["num_stages"],
     )  # fmt: skip

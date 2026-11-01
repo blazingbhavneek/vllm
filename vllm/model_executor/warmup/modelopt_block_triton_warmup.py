@@ -99,7 +99,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
         fused_configs: dict[tuple, int] = {}
         for m in range(1, max_tokens + 1):
             if m >= kernels.DEQUANT_MIN_M[codec] and n * k <= kernels.DEQUANT_MAX_NUMEL:
-                key = (codec, n, k)
+                key: tuple = (codec, n, k)
                 if key not in seen_dequant:
                     seen_dequant.add(key)
                     x = torch.zeros(
@@ -113,10 +113,11 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
                         module.weight_scale,
                         getattr(module, "iq2_lut", None),
                         codec,
+                        getattr(module, "weight_bf16", None),
                     )
                     warmed += 1
                 continue
-            cfg = kernels._linear_config(m, n, k, codec, num_sms, smem)
+            cfg = kernels._linear_config(m, n, k, codec, num_sms, smem, props.major)
             key = (codec, n, k, tuple(sorted(cfg.items())))
             if key not in seen_linear:
                 seen_linear.add(key)
@@ -129,6 +130,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
                 module.weight_scale,
                 getattr(module, "iq2_lut", None),
                 codec,
+                getattr(module, "weight_bf16", None),
             )
             warmed += 1
 
@@ -153,7 +155,7 @@ def _warm_moe(
     warm_k = module.w2_weight.shape[1]
     n1 = module.w13_weight.shape[1]
     n2 = module.w2_weight.shape[1]
-    k2 = module.w2_weight.shape[2] * method.block_size
+    k2 = module.w2_weight_scale.shape[2] * method.block_size
     mul_routed_weight = not module.apply_router_weight_on_input
     lut = kernels.iq2_lut(device) if codec == "iq2_xxs" else None
 
@@ -170,6 +172,8 @@ def _warm_moe(
             top_k,
             mul_routed_weight,
             gemv is not None,
+            module.expert_map is None,
+            module.activation,
             tuple(sorted(cfg.items())),
         )
         if key in seen:
@@ -191,7 +195,11 @@ def _warm_moe(
             0, num_experts, (rows, top_k), dtype=torch.int32, device=device
         )
         topk_weights = torch.rand((rows, top_k), dtype=torch.float32, device=device)
-        routing = moe_align_block_size(topk_ids, bm, num_experts, None)
+        routing = (
+            (None, topk_ids, None)
+            if gemv and module.expert_map is None
+            else moe_align_block_size(topk_ids, bm, num_experts, module.expert_map)
+        )
         a1 = torch.zeros((rows, warm_k), dtype=torch.bfloat16, device=device)
         c1 = torch.empty((rows, top_k, n1), dtype=torch.bfloat16, device=device)
         launch(
@@ -206,9 +214,10 @@ def _warm_moe(
             top_k,
             cfg,
             codec,
+            **({"apply_relu2": module.activation == "relu2_no_mul"} if gemv else {}),
         )
         a2 = torch.empty((rows * top_k, k2), dtype=torch.bfloat16, device=device)
-        c2 = torch.empty((rows, top_k, k2), dtype=torch.bfloat16, device=device)
+        c2 = torch.empty((rows, top_k, n2), dtype=torch.bfloat16, device=device)
         launch(
             a2,
             module.w2_weight,
