@@ -109,12 +109,13 @@ def bench_dense(args, props, rows):
                 continue
             x = torch.randn(M, K, dtype=torch.bfloat16)
             ref = x @ w.T
-            if t.DEQUANT_MIN_M[codec] <= M and N * K <= t.DEQUANT_MAX_NUMEL:
+            dequant = t.dequant_min_m(codec, torch.accelerator.current_device_index())
+            if dequant <= M and N * K <= t.DEQUANT_MAX_NUMEL:
                 cfg = "dequant+cuBLAS"
             else:
                 cfg = t._linear_config(
                     M, N, K, codec, props.multi_processor_count,
-                    props.shared_memory_per_block_optin,
+                    props.shared_memory_per_block_optin, props.major,
                 )  # fmt: skip
             run = partial(t._modelopt_block_linear, x, qweight, scales, lut, codec)
             timed = [(try_time(run, ref), cfg)]

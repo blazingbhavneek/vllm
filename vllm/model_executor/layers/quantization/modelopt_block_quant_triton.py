@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for ModelOpt IQ2_XXS / Q8_0 block weights on NVIDIA SM80+."""
+"""Triton kernels for ModelOpt IQ2_XXS / Q8_0 block weights on NVIDIA SM75+."""
 
 import functools
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -218,7 +219,7 @@ def _gemm_kernel(
             qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
             CODEC, False, BN, BK,
         )  # fmt: skip
-        acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)))
+        acc += tl.dot(x, tl.trans(w.to(x.dtype)))
     out = (pid_k * M + offs_m.to(tl.int64))[:, None] * N + offs_n[None, :]
     tl.store(
         out_ptr + out,
@@ -346,7 +347,7 @@ def _moe_gemm_kernel(
             row = a_ptr + (first // top_k) * stride_am
             single = tl.zeros((BN,), dtype=tl.float32)
             for k0 in range(0, K, BK):
-                # Match the tensor-core path's BF16 weight rounding.
+                # Match the tensor-core path's weight rounding.
                 single_w = (
                     _decode_tile(
                         qw_ptr,
@@ -362,7 +363,7 @@ def _moe_gemm_kernel(
                         BN,
                         BK,
                     )
-                    .to(tl.bfloat16)
+                    .to(a_ptr.dtype.element_ty)
                     .to(tl.float32)
                 )
                 single_x = tl.load(row + k0 + tl.arange(0, BK)).to(tl.float32)
@@ -386,7 +387,7 @@ def _moe_gemm_kernel(
             qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
             CODEC, False, BN, BK,
         )  # fmt: skip
-        acc += tl.dot(a, tl.trans(w.to(tl.bfloat16)))
+        acc += tl.dot(a, tl.trans(w.to(a.dtype)))
     if MUL_ROUTED_WEIGHT:
         weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         acc *= weight.to(tl.float32)[:, None]
@@ -490,13 +491,13 @@ def _q8_embedding_kernel(
     d = tl.load(sc_ptr + row * stride_sn + offs // 32, mask=mask).to(tl.float32)
     tl.store(
         out_ptr + t.to(tl.int64) * stride_om + offs,
-        (q * d).to(tl.bfloat16),
+        (q * d).to(out_ptr.dtype.element_ty),
         mask=mask,
     )
 
 
 def _linear_config(
-    M: int, N: int, K: int, codec: str, num_sms: int, smem: int, major: int = 0
+    M: int, N: int, K: int, codec: str, num_sms: int, smem: int, major: int
 ) -> dict[str, int]:
     if (
         major == 9
@@ -523,6 +524,10 @@ def _linear_config(
         bm, bn, bk, warps = 32 if M <= 32 else 64, 64, 128, 4
     else:
         bm, bn, bk, warps = 128 if smem >= 160 * 1024 else 64, 128, 64, 8
+    stages = 2
+    if major < 8 and bm >= 16:
+        # Turing has no tensor-core tl.dot; these FMA tiles don't spill on SM75.
+        bm, bn, bk, warps, stages = min(bm, 64), 64, 32, 8, 1
     bk = next(b for b in (256, 128, 64, 32) if b <= bk and K % b == 0)
     # Deterministic split-K (fp32 partials) until the grid covers the GPU a few
     # times. GEMV tiles are decode-bound, so give them many more CTAs; IQ2 spends
@@ -547,7 +552,7 @@ def _linear_config(
         "BK": bk,
         "SPLIT": split,
         "num_warps": warps,
-        "num_stages": 2,
+        "num_stages": stages,
     }
 
 
@@ -598,11 +603,12 @@ def dequantize_blocks(
     scales: torch.Tensor,
     lut: torch.Tensor | None,
     codec: str,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """bf16 [N, K] from 2-D `repack_blocks` output."""
+    """[N, K] in `dtype` from 2-D `repack_blocks` output."""
     N, nb = scales.shape
     K = nb * (256 if codec == "iq2_xxs" else 32)
-    out = torch.empty((N, K), dtype=torch.bfloat16, device=qweight.device)
+    out = torch.empty((N, K), dtype=dtype, device=qweight.device)
     bk = next(b for b in (256, 128, 64, 32) if K % b == 0)
     bn, warps = (8, 1) if codec == "iq2_xxs" else (32, 4)
     _dequant_kernel[(triton.cdiv(N, bn), K // bk)](
@@ -613,11 +619,28 @@ def dequantize_blocks(
 
 
 # From this many tokens, dequantize once and use cuBLAS, as AWQ does: the fused
-# GEMM decodes W once per M tile. Capping the bf16 copy at 128 MiB keeps
-# lm_head on the fused GEMM. H200 crossovers (2026-10-28): IQ2_XXS from 8,
-# Q8_0 from 64 tokens.
-DEQUANT_MIN_M = {"iq2_xxs": 8, "q8_0": 64}
+# GEMM decodes W once per M tile. Capping the copy at 128 MiB keeps lm_head on
+# the fused GEMM. The copy is a write and a read of 2 bytes per weight, so the
+# crossover tracks memory bandwidth: (HBM, GDDR) values were measured on an
+# H200 and an RTX 5060 Ti.
+DEQUANT_MIN_M = {"iq2_xxs": (8, 128), "q8_0": (64, 256)}
 DEQUANT_MAX_NUMEL = 1 << 26
+
+
+@functools.cache
+def _is_hbm(device: int) -> bool:
+    # ponytail: bus width as the bandwidth class (HBM is >= 1024 bits wide),
+    # calibrated on one GPU per class; use per-arch tables if a GPU disagrees.
+    return torch.cuda.get_device_properties(device).memory_bus_width >= 1024
+
+
+def dequant_min_m(codec: str, device: int) -> int:
+    """Token count from which `modelopt_block_linear` dequantizes for cuBLAS."""
+    if torch.cuda.get_device_properties(device).major < 8:
+        # ponytail: Turing's fused GEMM runs on FMA while cuBLAS keeps tensor
+        # cores; 32 is a T4 roofline estimate, not a measurement.
+        return 32
+    return DEQUANT_MIN_M[codec][not _is_hbm(device)]
 
 
 def _modelopt_block_linear(
@@ -631,7 +654,7 @@ def _modelopt_block_linear(
     """Packed block GEMM; picks the kernel from M inside the op.
 
     Args:
-        x: bf16 [M, K].
+        x: bf16 or fp16 [M, K].
         qweight: int32 [N, K / 16] (IQ2_XXS) or int8 [N, K] (Q8_0).
         scales: fp16 [N, K / block_size].
         lut: `iq2_lut` for IQ2_XXS, None for Q8_0.
@@ -639,17 +662,20 @@ def _modelopt_block_linear(
         weight_bf16: Optional cached dequantized weights for the BF16 GEMM path.
 
     Returns:
-        bf16 [M, N].
+        [M, N] in x's dtype.
 
     """
     M, K = x.shape
     if M == 0:
         return x.new_empty((0, qweight.shape[0]))
-    if DEQUANT_MIN_M[codec] <= M and qweight.shape[0] * K <= DEQUANT_MAX_NUMEL:
+    if (
+        dequant_min_m(codec, x.device.index) <= M
+        and qweight.shape[0] * K <= DEQUANT_MAX_NUMEL
+    ):
         weight = (
             weight_bf16
             if weight_bf16 is not None
-            else dequantize_blocks(qweight, scales, lut, codec)
+            else dequantize_blocks(qweight, scales, lut, codec, x.dtype)
         )
         return x @ weight.T
     if x.stride(1) != 1:
@@ -679,11 +705,11 @@ def _modelopt_block_linear_fake(
 
 
 def _modelopt_block_embedding(
-    ids: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor
+    ids: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Gather and decode Q8_0 rows: ids [T] -> bf16 [T, H]."""
+    """Gather and decode Q8_0 rows: ids [T] -> [T, H] in `dtype`."""
     out = torch.empty(
-        (ids.numel(), qweight.shape[1]), dtype=torch.bfloat16, device=qweight.device
+        (ids.numel(), qweight.shape[1]), dtype=dtype, device=qweight.device
     )
     if ids.numel():
         _q8_embedding_kernel[(ids.numel(), triton.cdiv(out.shape[1], 1024))](
@@ -694,9 +720,9 @@ def _modelopt_block_embedding(
 
 
 def _modelopt_block_embedding_fake(
-    ids: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor
+    ids: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype
 ) -> torch.Tensor:
-    return qweight.new_empty((ids.numel(), qweight.shape[1]), dtype=torch.bfloat16)
+    return qweight.new_empty((ids.numel(), qweight.shape[1]), dtype=dtype)
 
 
 direct_register_custom_op(
@@ -720,9 +746,11 @@ def moe_gemv_config(M: int, E: int, top_k: int, codec: str) -> dict[str, int] | 
     0.66x at M=32 - those wide one-warp grids stop paying for themselves, so
     above 8 rows `moe_config`'s padded `tl.dot` tiles go back to winning. A
     standalone kernel sweep disagrees (still 2.6x ahead at M=16); it has no
-    other work on the GPU, serving does.
+    other work on the GPU, serving does. On GDDR GPUs the GEMV stays ahead
+    through 64 rows (RTX 5060 Ti: 1.5-2.4x at M=16-64).
     """
-    if M > 8:
+    max_rows = 8 if _is_hbm(torch.accelerator.current_device_index()) else 64
+    if max_rows < M:
         return None
     bn, bk, warps = (8, 256, 1) if codec == "iq2_xxs" else (32, 256, 4)
     return {"BN": bn, "BK": bk, "num_warps": warps, "num_stages": 2}
@@ -778,11 +806,15 @@ def moe_config(M: int, E: int, top_k: int) -> dict[str, int]:
         bm, bn, bk = 128, 128, 64
     # BN * BK <= 8192 keeps every tile under 60 KB of shared memory on SM80-SM120.
     # H200 profiling favors one stage and four warps, including BM128.
+    warps = 4
+    if not current_platform.has_device_capability(80):
+        # Turing has no tensor-core tl.dot; these FMA tiles don't spill on SM75.
+        bm, bn, bk, warps = min(bm, 64), 64, 32, 8
     return {
         "BLOCK_SIZE_M": bm,
         "BN": bn,
         "BK": bk,
-        "num_warps": 4,
+        "num_warps": warps,
         "num_stages": 1,
     }
 
@@ -805,11 +837,13 @@ def invoke_block_moe_kernel(
     """One grouped GEMM of the fused MoE: c[slot] = a[slot // top_k] @ W[e]^T.
 
     Args:
-        a: bf16 [M, K] (GEMM1, top_k > 1) or [M * top_k, K] (GEMM2, top_k == 1).
+        a: bf16 or fp16 [M, K] (GEMM1, top_k > 1) or [M * top_k, K]
+            (GEMM2, top_k == 1).
         qweight: packed [E, N, ...] from `repack_blocks`.
         scales: fp16 [E, N, K / block_size].
         lut: `iq2_lut` for IQ2_XXS, None for Q8_0.
-        c: bf16 [..., N], written at row `slot` of its flattened leading dims.
+        c: [..., N] in a's dtype, written at row `slot` of its flattened
+            leading dims.
         topk_weights: [M, top_k] router weights.
         sorted_token_ids: from `moe_align_block_size`.
         expert_ids: from `moe_align_block_size`.

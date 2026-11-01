@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
 from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
     _IQ2XXS_GRID,
     _linear_config,
+    dequant_min_m,
     dequantize_blocks,
     iq2_lut,
     launch_linear,
@@ -101,9 +102,9 @@ def linear(x, raw, codec):
 
 
 def assert_close_to_cublas(out, x, w):
-    """Our error vs the exact product must be within 1.5x of bf16 cuBLAS's."""
+    """Our error vs the exact product must be within 1.5x of cuBLAS's in x.dtype."""
     want = x.double() @ w.double().T
-    cublas = (x @ w.bfloat16().T).double()
+    cublas = (x @ w.to(x.dtype).T).double()
     ours = (out.double() - want).abs().max()
     assert ours <= 1.5 * (cublas - want).abs().max() + 1e-6, ours
 
@@ -134,19 +135,20 @@ def test_decode_bit_exact(codec):
     assert torch.equal(launch_linear(eye, qweight, scales, lut, codec, gemm).T, want)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
 @pytest.mark.parametrize(
     "M", [1, 2, 3, 4, 8, 15, 16, 17, 33, 64, 65, 128, 255, 256, 1000, 2048]
 )
-def test_linear_matches_reference(codec, M):
+def test_linear_matches_reference(codec, M, dtype):
     raw = make_raw((1032,), K_FOR[codec], codec, seed=M)
-    x = torch.randn(M, K_FOR[codec], device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(M, K_FOR[codec], device="cuda", dtype=dtype)
     assert_close_to_cublas(linear(x, raw, codec), x, ref_decode(raw, codec))
 
 
 def test_linear_odd_k_steps():
     """An odd K step count splits too: shared_down has 5376 = 21 * 256 steps."""
-    assert _linear_config(1, 4096, 5376, "iq2_xxs", 132, 227 * 1024)["SPLIT"] == 7
+    assert _linear_config(1, 4096, 5376, "iq2_xxs", 132, 227 * 1024, 9)["SPLIT"] == 7
     raw = make_raw((136,), 5376, "iq2_xxs", seed=3)
     x = torch.randn(1, 5376, device="cuda", dtype=torch.bfloat16)
     assert_close_to_cublas(linear(x, raw, "iq2_xxs"), x, ref_decode(raw, "iq2_xxs"))
@@ -175,7 +177,8 @@ def test_iq2_dense_cache_preserves_dispatch_and_outputs(M):
     qw, scales = repack_blocks(raw, "iq2_xxs")
     lut = iq2_lut(raw.device)
     cached = dequantize_blocks(qw, scales, lut, "iq2_xxs")
-    if M < 8:
+    min_m = dequant_min_m("iq2_xxs", torch.accelerator.current_device_index())
+    if min_m > M:
         cached.fill_(float("nan"))
     x = torch.randn(M, 5376, device="cuda", dtype=torch.bfloat16)
     want = torch.ops.vllm.modelopt_block_linear(x, qw, scales, lut, "iq2_xxs")
@@ -275,23 +278,23 @@ def ref_moe(x, w1, w2, topk_weights, topk_ids, activation, dtype):
     return out
 
 
-def assert_moe_close_to_bf16(out, x, w1, w2, topk_weights, topk_ids, activation):
-    """Our error vs the exact MoE must be within 2x of an unfused bf16 MoE's.
+def assert_moe_close_to_unfused(out, x, w1, w2, topk_weights, topk_ids, activation):
+    """Our error vs the exact MoE must be within 2x of an unfused MoE's in x.dtype.
 
     Over random inputs the ratio has a median of ~0.9 and a tail to ~1.6; a
     routing or weighting bug is orders of magnitude off.
 
-    Plus one bf16 ulp of the output scale: the fused contract keeps c1/c2 in the
+    Plus one ulp of the output scale: the fused contract keeps c1/c2 in the
     model dtype, so anything under a ulp of the largest output cannot show up in
     the result. Real Bolt expert weights need this slack at decode sizes (2-4x
     the bare 2x bar at M=4) while matching a torch simulation of the same bf16
     buffer chain exactly, so the slack is the buffers, not the kernels.
     """
     want = ref_moe(x, w1, w2, topk_weights, topk_ids, activation, torch.float64)
-    bf16 = ref_moe(x, w1, w2, topk_weights, topk_ids, activation, torch.bfloat16)
+    unfused = ref_moe(x, w1, w2, topk_weights, topk_ids, activation, x.dtype)
     ours = (out.double() - want).abs().max()
-    ulp = want.abs().max().double() * 2**-8
-    assert ours <= 2 * (bf16 - want).abs().max() + ulp + 1e-6, ours
+    ulp = want.abs().max().double() * torch.finfo(x.dtype).eps / 2
+    assert ours <= 2 * (unfused - want).abs().max() + ulp + 1e-6, ours
 
 
 def make_moe(codec, activation, E=16, K=1024, inter=512, top_k=2):
@@ -391,12 +394,13 @@ def test_moe_gemv_direct_routing_matches_aligned(codec, M, top_k, fused_relu2):
 @pytest.mark.parametrize("activation", [MoEActivation.RELU2_NO_MUL, MoEActivation.SILU])
 @pytest.mark.parametrize("top_k", [2, 9])
 @pytest.mark.parametrize("M", [1, 7, 64, 333])
-def test_moe_matches_reference(codec, activation, top_k, M, workspace_init):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_moe_matches_reference(codec, activation, top_k, M, dtype, workspace_init):
     run, w1, w2 = make_moe(codec, activation, top_k=top_k)
-    x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(M, 1024, device="cuda", dtype=dtype)
     topk_weights, topk_ids = make_routing(M, 16, top_k)
     got = run(x, topk_weights, topk_ids)
-    assert_moe_close_to_bf16(got, x, w1, w2, topk_weights, topk_ids, activation)
+    assert_moe_close_to_unfused(got, x, w1, w2, topk_weights, topk_ids, activation)
 
 
 @pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
@@ -427,7 +431,7 @@ def test_moe_paths_agree(codec, M, workspace_init, monkeypatch):
     assert gap <= bar + 1e-6, (gap.item(), bar.item())
 
 
-@pytest.mark.parametrize("M", [1, 8, 16])  # 1, 8 -> GEMV path; 16 -> the tl.dot path
+@pytest.mark.parametrize("M", [1, 8, 65])  # 1, 8 -> GEMV path; 65 -> the tl.dot path
 def test_moe_cuda_graph_new_routing(M, workspace_init):
     """Routing changes every step when serving; replays must follow it."""
     run, w1, w2 = make_moe("iq2_xxs", MoEActivation.RELU2_NO_MUL, top_k=9)
@@ -445,27 +449,29 @@ def test_moe_cuda_graph_new_routing(M, workspace_init):
         allocated = torch.accelerator.memory_allocated()
         graph.replay()
         assert torch.accelerator.memory_allocated() == allocated
-        assert_moe_close_to_bf16(
+        assert_moe_close_to_unfused(
             out, x, w1, w2, topk_weights, topk_ids, MoEActivation.RELU2_NO_MUL
         )
 
 
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
-def test_q8_embedding_exact(id_dtype):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_q8_embedding_exact(id_dtype, dtype):
     raw = make_raw((300,), 2048, "q8_0", seed=9, extreme=True)
     qweight, scales = repack_blocks(raw, "q8_0")
     ids = torch.tensor([5, 5, 299, 0, 17, 3, 5], device="cuda", dtype=id_dtype)
-    out = torch.ops.vllm.modelopt_block_embedding(ids, qweight, scales)
-    assert torch.equal(out, ref_decode(raw[ids.long()], "q8_0").bfloat16())
+    out = torch.ops.vllm.modelopt_block_embedding(ids, qweight, scales, dtype)
+    assert torch.equal(out, ref_decode(raw[ids.long()], "q8_0").to(dtype))
 
 
 @pytest.mark.parametrize("codec", ["iq2_xxs", "q8_0"])
 @pytest.mark.parametrize("M", [16, 32])
 @pytest.mark.parametrize("activation", [MoEActivation.RELU2_NO_MUL, MoEActivation.SILU])
 def test_moe_singleton_tiles_follow_routing_under_graph(
-    codec, M, activation, workspace_init
+    codec, M, activation, workspace_init, monkeypatch
 ):
     """A graph follows singleton and shared-expert routes without dropping rows."""
+    monkeypatch.setattr(moe_mod, "moe_gemv_config", lambda *a: None)  # tl.dot path
     run, w1, w2 = make_moe(codec, activation, E=128, top_k=2)
     x = torch.randn(M, 1024, device="cuda", dtype=torch.bfloat16)
     weights = torch.rand((M, 2), device="cuda").softmax(-1)
@@ -480,4 +486,4 @@ def test_moe_singleton_tiles_follow_routing_under_graph(
     ):
         ids.copy_(routing)
         graph.replay()
-        assert_moe_close_to_bf16(out, x, w1, w2, weights, ids, activation)
+        assert_moe_close_to_unfused(out, x, w1, w2, weights, ids, activation)

@@ -55,6 +55,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import get_quant_config
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -1562,7 +1563,8 @@ def test_modelopt_block_quant_dense_loading_preserves_whole_blocks(
             }
         }
     )
-    method = config.get_quant_method(MagicMock(spec=LinearBase), prefix)
+    with set_default_torch_dtype(torch.bfloat16):
+        method = config.get_quant_method(MagicMock(spec=LinearBase), prefix)
     assert isinstance(method, ModelOptBlockQuantLinearMethod)
     layer = torch.nn.Module()
     n, k = (128, 256) if parallel == "row" else (64, 512)
@@ -1690,23 +1692,26 @@ _requires_sm80 = pytest.mark.skipif(
 
 @_requires_sm80
 @pytest.mark.parametrize(
-    "b12x,backend,codec,expected",
+    "b12x,backend,codec,dtype,expected",
     [
-        (True, "auto", "iq2_xxs", "b12x"),
-        (True, "triton", "iq2_xxs", "triton"),
-        (False, "auto", "iq2_xxs", "triton"),
-        (False, "auto", "q8_0", "triton"),
-        (False, "triton", "q8_0", "triton"),
-        (False, "b12x", "iq2_xxs", "error"),
-        (False, "marlin", "iq2_xxs", "error"),
-        (False, "auto", "iq2_xs", "error"),
+        (True, "auto", "iq2_xxs", torch.bfloat16, "b12x"),
+        (True, "triton", "iq2_xxs", torch.bfloat16, "triton"),
+        (True, "auto", "iq2_xxs", torch.float16, "triton"),
+        (True, "b12x", "q8_0", torch.float16, "error"),
+        (False, "auto", "iq2_xxs", torch.bfloat16, "triton"),
+        (False, "auto", "q8_0", torch.float16, "triton"),
+        (False, "triton", "q8_0", torch.bfloat16, "triton"),
+        (False, "auto", "q8_0", torch.float32, "error"),
+        (False, "b12x", "iq2_xxs", torch.bfloat16, "error"),
+        (False, "marlin", "iq2_xxs", torch.bfloat16, "error"),
+        (False, "auto", "iq2_xs", torch.bfloat16, "error"),
     ],
 )
 def test_modelopt_block_quant_backend_selection(
-    monkeypatch, b12x, backend, codec, expected
+    monkeypatch, b12x, backend, codec, dtype, expected
 ):
-    """b12x stays the SM12x default; elsewhere IQ2_XXS / Q8_0 take Triton, and
-    unsupported requests fail at construction."""
+    """b12x stays the SM12x BF16 default; elsewhere IQ2_XXS / Q8_0 take Triton,
+    and unsupported requests fail at construction."""
     import vllm.utils.b12x as b12x_utils
     from vllm.config import KernelConfig
     from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
@@ -1727,12 +1732,13 @@ def test_modelopt_block_quant_backend_selection(
     )
     moe_config = _iq2_xs_moe_config()
     moe_config.moe_backend = backend
+    moe_config.in_dtype = dtype
     builders = (
         lambda: ModelOptBlockQuantMoEMethod(moe_config, codec=codec),
         lambda: ModelOptBlockQuantLinearMethod(codec),
     )
     vllm_config = VllmConfig(kernel_config=KernelConfig(linear_backend=backend))
-    with set_current_vllm_config(vllm_config):
+    with set_current_vllm_config(vllm_config), set_default_torch_dtype(dtype):
         for build in builders:
             if expected == "error":
                 with pytest.raises(ValueError, match=f"ModelOpt {codec.upper()}"):
@@ -1844,7 +1850,8 @@ def _make_tiny_modelopt_block_model(tmp_path):
 
 
 @_requires_sm80
-def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
+@pytest.mark.parametrize("dtype", ["bfloat16", "half"])
+def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner, dtype):
     """Compiled and eager block-quantized Nemotron-H agree in logprobs."""
     from tests.models.utils import check_logprobs_close
     from vllm import SamplingParams
@@ -1857,6 +1864,7 @@ def test_modelopt_block_triton_tiny_nemotron_h(tmp_path, vllm_runner):
         with vllm_runner(
             str(tmp_path),
             load_format="dummy",
+            dtype=dtype,
             skip_tokenizer_init=True,
             max_model_len=256,
             max_num_seqs=4,

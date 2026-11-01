@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ModelOpt safetensors block codecs with BF16 activations."""
+"""ModelOpt safetensors block codecs with BF16 or FP16 activations."""
 
 import torch
 
@@ -45,24 +45,27 @@ from vllm.utils.b12x import B12X_BLOCK_CODECS, B12xWarmupUnit, get_b12x_blocksca
 logger = init_logger(__name__)
 
 
-def _use_triton(codec: str, backend: str, b12x_supported: bool, kind: str) -> bool:
+def _use_triton(
+    codec: str, backend: str, b12x_supported: bool, kind: str, dtype: torch.dtype
+) -> bool:
     """Pick b12x (False) or the Triton kernels (True); raise if neither applies."""
-    if backend in ("auto", "b12x") and b12x_supported:
+    if backend in ("auto", "b12x") and b12x_supported and dtype == torch.bfloat16:
         return False
     if (
         backend in ("auto", "triton")
         and codec in ("iq2_xxs", "q8_0")
+        and dtype in (torch.bfloat16, torch.float16)
         and current_platform.is_cuda()
-        and current_platform.has_device_capability(80)
+        and current_platform.has_device_capability(75)
     ):
         logger.info_once(
             "Using Triton kernels for ModelOpt %s %s weights.", codec.upper(), kind
         )
         return True
     raise ValueError(
-        f"ModelOpt {codec.upper()} {kind} weights run on b12x (SM120/SM121) or, "
-        f"for IQ2_XXS and Q8_0 on NVIDIA SM80+, on Triton; the requested {kind} "
-        f"backend {backend!r} is not available here."
+        f"ModelOpt {codec.upper()} {kind} weights run on b12x (SM120/SM121, BF16) "
+        f"or, for IQ2_XXS and Q8_0 on NVIDIA SM75+ in BF16 or FP16, on Triton; "
+        f"the requested {kind} backend {backend!r} is not available for {dtype}."
     )
 
 
@@ -105,13 +108,12 @@ class ModelOptBlockQuantMoEMethod(FusedMoEMethodBase):
             moe_config.moe_backend,
             B12xExperts._supports_current_device(),
             "MoE",
+            moe_config.in_dtype,
         )
         if not B12xExperts._supports_parallel_config(moe_config.moe_parallel_config):
             raise ValueError(
                 "Block-quantized supports tensor parallelism without EP or EPLB"
             )
-        if moe_config.in_dtype != torch.bfloat16:
-            raise ValueError("Block-quantized routed experts require BF16 activations")
         if (
             moe_config.activation
             not in (MoEActivation.SILU, MoEActivation.RELU2_NO_MUL)
@@ -325,6 +327,8 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
             and hasattr(api, "BlockQuantLinearWeight")
             and api.is_supported(),
             "linear",
+            # The params_dtype that LinearBase passes to create_weights.
+            torch.get_default_dtype(),
         )
 
     def create_weights(
@@ -343,13 +347,14 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         ) and not isinstance(layer, ParallelLMHead)
         if self.is_embedding and self.codec != "q8_0":
             raise ValueError("packed embedding currently requires Q8_0")
+        self.params_dtype = params_dtype
         if (
-            params_dtype != torch.bfloat16
+            params_dtype not in (torch.bfloat16, torch.float16)
             or input_size_per_partition % self.block_size
             or n % 8
         ):
             raise ValueError(
-                f"{self.codec.upper()} dense weights require BF16, "
+                f"{self.codec.upper()} dense weights require BF16 or FP16, "
                 f"K{self.block_size} and N8"
             )
         layer.register_parameter(
@@ -380,6 +385,7 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
             cached_weight = None
             if (
                 self.codec == "iq2_xxs"
+                and self.params_dtype == torch.bfloat16
                 and get_current_vllm_config().kernel_config.modelopt_iq2_dense_cache
                 and scales.numel() * self.block_size <= DEQUANT_MAX_NUMEL
             ):
@@ -485,9 +491,9 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
         )
 
     def apply(self, layer, x, bias=None):
-        if x.dtype != torch.bfloat16:
+        if x.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(
-                "Block-quantized dense execution requires BF16 activations"
+                "Block-quantized dense execution requires BF16 or FP16 activations"
             )
         if self.use_triton:
             out = torch.ops.vllm.modelopt_block_linear(
@@ -514,7 +520,7 @@ class ModelOptBlockQuantLinearMethod(LinearMethodBase):
     def embedding(self, layer, input_):
         if self.use_triton:
             return torch.ops.vllm.modelopt_block_embedding(
-                input_.reshape(-1), layer.weight, layer.weight_scale
+                input_.reshape(-1), layer.weight, layer.weight_scale, self.params_dtype
             ).view(*input_.shape, -1)
         plan = layer.b12x_embedding_plans[input_.dtype]
         width = layer.weight.shape[1] * self.block_size

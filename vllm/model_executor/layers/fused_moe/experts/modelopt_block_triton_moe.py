@@ -41,7 +41,7 @@ class ModelOptBlockTritonExperts(TritonExperts):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cuda() and current_platform.has_device_capability(80)
+        return current_platform.is_cuda() and current_platform.has_device_capability(75)
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:

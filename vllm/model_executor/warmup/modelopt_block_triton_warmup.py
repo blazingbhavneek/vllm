@@ -61,6 +61,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
 
     max_tokens = _warmup_token_counts(worker)
     props = torch.cuda.get_device_properties(worker.device)
+    dtype = worker.vllm_config.model_config.dtype
     num_sms = props.multi_processor_count
     smem = props.shared_memory_per_block_optin
 
@@ -79,6 +80,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
                 moe_align_block_size,
                 max_tokens,
                 seen_moe,
+                dtype,
             )
             warmed += 1
             continue
@@ -88,7 +90,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
             for id_dtype in (torch.int64, torch.int32):
                 ids = torch.zeros(1, dtype=id_dtype, device=device)
                 torch.ops.vllm.modelopt_block_embedding(
-                    ids, module.weight, module.weight_scale
+                    ids, module.weight, module.weight_scale, dtype
                 )
             warmed += 1
             continue
@@ -97,16 +99,13 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
         n = qweight.shape[0]
         k = module.weight_scale.shape[1] * method.block_size
         fused_configs: dict[tuple, int] = {}
+        min_m = kernels.dequant_min_m(codec, device.index)
         for m in range(1, max_tokens + 1):
-            if m >= kernels.DEQUANT_MIN_M[codec] and n * k <= kernels.DEQUANT_MAX_NUMEL:
+            if m >= min_m and n * k <= kernels.DEQUANT_MAX_NUMEL:
                 key: tuple = (codec, n, k)
                 if key not in seen_dequant:
                     seen_dequant.add(key)
-                    x = torch.zeros(
-                        (kernels.DEQUANT_MIN_M[codec], k),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    )
+                    x = torch.zeros((min_m, k), dtype=dtype, device=device)
                     torch.ops.vllm.modelopt_block_linear(
                         x,
                         qweight,
@@ -123,7 +122,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
                 seen_linear.add(key)
                 fused_configs[key] = m
         for key, m in fused_configs.items():
-            x = torch.zeros((m, k), dtype=torch.bfloat16, device=device)
+            x = torch.zeros((m, k), dtype=dtype, device=device)
             torch.ops.vllm.modelopt_block_linear(
                 x,
                 qweight,
@@ -147,6 +146,7 @@ def _warm_moe(
     moe_align_block_size,
     max_tokens: int,
     seen: set[tuple],
+    dtype: torch.dtype,
 ) -> None:
     codec = method.codec
     device = module.w13_weight.device
@@ -200,8 +200,8 @@ def _warm_moe(
             if gemv and module.expert_map is None
             else moe_align_block_size(topk_ids, bm, num_experts, module.expert_map)
         )
-        a1 = torch.zeros((rows, warm_k), dtype=torch.bfloat16, device=device)
-        c1 = torch.empty((rows, top_k, n1), dtype=torch.bfloat16, device=device)
+        a1 = torch.zeros((rows, warm_k), dtype=dtype, device=device)
+        c1 = torch.empty((rows, top_k, n1), dtype=dtype, device=device)
         launch(
             a1,
             module.w13_weight,
@@ -221,8 +221,8 @@ def _warm_moe(
                 else {}
             ),
         )
-        a2 = torch.empty((rows * top_k, k2), dtype=torch.bfloat16, device=device)
-        c2 = torch.empty((rows, top_k, n2), dtype=torch.bfloat16, device=device)
+        a2 = torch.empty((rows * top_k, k2), dtype=dtype, device=device)
+        c2 = torch.empty((rows, top_k, n2), dtype=dtype, device=device)
         launch(
             a2,
             module.w2_weight,
