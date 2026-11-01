@@ -322,7 +322,6 @@ def _moe_gemm_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
-    SINGLETON_GEMV: tl.constexpr = True,
 ):
     """`fused_moe_kernel` with B decoded from packed blocks of expert e."""
     pid = tl.program_id(0)
@@ -339,7 +338,7 @@ def _moe_gemm_kernel(
     a_rows = a_ptr + (offs_token // top_k)[:, None] * stride_am
     qw_ptr += e * stride_qe
     sc_ptr += e * stride_se
-    if tl.constexpr(SINGLETON_GEMV and BM == 64 and BN == 32 and BK == 128):
+    if tl.constexpr(BM == 64 and BN == 32 and BK == 128):
         # Sparse expert tiles avoid multiplying 63 padding rows by decoded weights.
         first = tl.load(sorted_token_ids_ptr + pid_m * BM).to(tl.int64)
         second = tl.load(sorted_token_ids_ptr + pid_m * BM + 1)
@@ -621,26 +620,23 @@ def dequantize_blocks(
 # From this many tokens, dequantize once and use cuBLAS, as AWQ does: the fused
 # GEMM decodes W once per M tile. Capping the copy at 128 MiB keeps lm_head on
 # the fused GEMM. The copy is a write and a read of 2 bytes per weight, so the
-# crossover tracks memory bandwidth: (HBM, GDDR) values were measured on an
-# H200 and an RTX 5060 Ti. On GDDR the fused IQ2_XXS GEMM doubles in cost past
-# one 64-row M tile while dequant + cuBLAS barely moves, so IQ2 switches at 65
-# (5060 Ti, RTX 3090 and L40S agree: dequant 1.5-2.1x faster at M=96).
+# crossover tracks memory bandwidth. Values are (HBM, GDDR). On GDDR the fused
+# IQ2_XXS GEMM doubles in cost past one 64-row M tile, hence 65.
 DEQUANT_MIN_M = {"iq2_xxs": (8, 65), "q8_0": (64, 256)}
 DEQUANT_MAX_NUMEL = 1 << 26
 
 
 @functools.cache
 def _is_hbm(device: int) -> bool:
-    # ponytail: bus width as the bandwidth class (HBM is >= 1024 bits wide),
-    # calibrated on one GPU per class; use per-arch tables if a GPU disagrees.
+    # Bus width as the bandwidth class: HBM is at least 1024 bits wide.
     return torch.cuda.get_device_properties(device).memory_bus_width >= 1024
 
 
 def dequant_min_m(codec: str, device: int) -> int:
     """Token count from which `modelopt_block_linear` dequantizes for cuBLAS."""
     if torch.cuda.get_device_properties(device).major < 8:
-        # ponytail: Turing's fused GEMM runs on FMA while cuBLAS keeps tensor
-        # cores; 32 is a T4 roofline estimate, not a measurement.
+        # Turing's fused GEMM runs on FMA while cuBLAS keeps tensor cores.
+        # 32 is a roofline estimate for T4.
         return 32
     return DEQUANT_MIN_M[codec][not _is_hbm(device)]
 
@@ -743,14 +739,9 @@ def moe_gemv_config(M: int, E: int, top_k: int, codec: str) -> dict[str, int] | 
     """Tiles for the decode path, or None when `moe_config`'s tiles win.
 
     One program per routed row: no `moe_align_block_size` padding and no
-    tensor-core transposes, which is what a tiny decode step wants. Measured in
-    serving on Bolt (H200): 1.46x faster at M=1, 1.12x at M=8, 0.90x at M=16,
-    0.66x at M=32 - those wide one-warp grids stop paying for themselves, so
-    above 8 rows `moe_config`'s padded `tl.dot` tiles go back to winning. A
-    standalone kernel sweep disagrees (still 2.6x ahead at M=16); it has no
-    other work on the GPU, serving does. GDDR agrees: on an L40S the sweep
-    keeps GEMV ahead through M=128, yet serving with 8 rows instead of 64 is
-    4% faster at concurrency 16 and 7% at 32.
+    tensor-core transposes, which suits a small decode step. In serving, on
+    both HBM and GDDR GPUs, `moe_config`'s padded `tl.dot` tiles win above 8
+    rows, even though a standalone kernel sweep keeps the GEMV ahead longer.
     """
     if M > 8:
         return None
@@ -866,7 +857,6 @@ def invoke_block_moe_kernel(
         num_tokens_post_padded, N, a.size(1), em, a.size(0) * top_k, a.stride(0),
         qweight.stride(0), qweight.stride(1), scales.stride(0), scales.stride(1),
         c.stride(-2), top_k=top_k, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        SINGLETON_GEMV=config.get("SINGLETON_GEMV", True),
         CODEC=_CODEC_ID[codec], BM=bm, BN=config["BN"], BK=config["BK"],
         num_warps=config["num_warps"], num_stages=config["num_stages"],
     )  # fmt: skip
