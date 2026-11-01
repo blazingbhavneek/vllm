@@ -214,7 +214,12 @@ def _warm_moe(
             top_k,
             cfg,
             codec,
-            **({"apply_relu2": module.activation == "relu2_no_mul"} if gemv else {}),
+            # MoEActivation is a plain Enum: compare its value, not the member.
+            **(
+                {"apply_relu2": module.activation.value == "relu2_no_mul"}
+                if gemv
+                else {}
+            ),
         )
         a2 = torch.empty((rows * top_k, k2), dtype=torch.bfloat16, device=device)
         c2 = torch.empty((rows, top_k, n2), dtype=torch.bfloat16, device=device)
