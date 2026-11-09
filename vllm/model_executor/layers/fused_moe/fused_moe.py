@@ -298,6 +298,8 @@ def fused_moe_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+# EM and num_valid_tokens change with every batch; specializing on their values
+# (== 1, % 16) would only multiply compiles.
 @triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
 def fused_moe_kernel(
     # Pointers to matrices
@@ -385,6 +387,9 @@ def fused_moe_kernel(
     - naive_block_assignment: A boolean flag indicating whether to use naive
         token wise block assignment. If True, each block corresponds to a
         single token.
+    - BLOCK_CODEC: >= 0 when B holds packed ModelOpt IQ2_XXS / Q8_0 blocks
+        (`modelopt_block_quant_triton`), with `b_scale_ptr` the fp16 block
+        scales and `b_lut_ptr` the IQ2 table; -1 for every other B.
     This kernel performs the multiplication of a token by its corresponding
     expert matrix as determined by `expert_ids`. The sorting of
     `sorted_token_ids` by expert index and padding ensures divisibility by
@@ -605,6 +610,7 @@ def fused_moe_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
         if BLOCK_CODEC >= 0:
+            # Packed block-codec B, decoded with its block scales applied.
             b = (
                 _decode_tile(
                     b_ptr + off_experts * stride_be,
@@ -616,9 +622,9 @@ def fused_moe_kernel(
                     stride_bn,
                     stride_bsn,
                     BLOCK_CODEC,
-                    False,
-                    BLOCK_SIZE_N,
-                    BLOCK_SIZE_K,
+                    BN=BLOCK_SIZE_N,
+                    BK=BLOCK_SIZE_K,
+                    GATHER=False,
                 )
                 .to(compute_type)
                 .T
@@ -1027,6 +1033,7 @@ def invoke_fused_moe_triton_kernel(
         num_tokens_post_padded,
         a_desc,
         B.size(1),
+        # A packed block-codec B's last dim is not K.
         A.size(1) if block_codec >= 0 else B.size(2),
         EM,
         num_tokens,

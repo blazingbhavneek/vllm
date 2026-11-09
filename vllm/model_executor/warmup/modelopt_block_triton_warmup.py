@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _warmup_token_counts(worker: "Worker") -> int:
+def _max_tokens(worker: "Worker") -> int:
+    """The largest token count one forward pass can see."""
     scheduler = worker.scheduler_config
     compilation = worker.vllm_config.compilation_config
     sizes = [
@@ -56,7 +57,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
         modelopt_block_quant_triton as kernels,
     )
 
-    max_tokens = _warmup_token_counts(worker)
+    max_tokens = _max_tokens(worker)
     props = torch.cuda.get_device_properties(worker.device)
     dtype = worker.vllm_config.model_config.dtype
     num_sms = props.multi_processor_count
@@ -116,6 +117,7 @@ def modelopt_block_triton_warmup(worker: "Worker") -> None:
         )
         for m in sorted(counts):
             cfg = kernels._linear_config(m, n, k, codec, num_sms, smem, props.major)
+            # The split-K sum's size argument (m * n) is specialized on % 16.
             key = (codec, n, k, dtype, (m * n) % 16 == 0, tuple(sorted(cfg.items())))
             if key not in seen_linear:
                 seen_linear.add(key)
@@ -147,8 +149,10 @@ def _warm_moe(
 ) -> None:
     e, k = module.w2_weight.shape[:2]
     top_k = module.top_k
-    # Dispatch changes at 8 rows, 1 and 64 rows/expert, and the shared
-    # direct-routing threshold. Warm through the same pipeline as inference.
+    # Configs change at 8 rows (GEMV), at 1 and 64 rows per expert
+    # (`moe_config`) and where `_prepare_expert_assignment` stops skipping the
+    # token sort (M * top_k * 4 <= E); Triton also specializes on M == 1.
+    # Warm through `method.apply`, the same pipeline as inference.
     counts = {
         1,
         2,

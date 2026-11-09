@@ -4,7 +4,7 @@
 
 Dense layers are compared with bf16 cuBLAS on the dequantized weights, MoE
 layers with vLLM's bf16 Triton `fused_experts`. Timing: CUDA graph, cold L2,
-median.
+median replay of the best of 3 captures.
 
     python benchmarks/kernels/benchmark_modelopt_block_triton.py
     python benchmarks/kernels/benchmark_modelopt_block_triton.py \
@@ -52,13 +52,20 @@ MOE_M = [1, 2, 4, 8, 16, 64, 256, 1024, 4096]
 BLOCK = {"iq2_xxs": (256, 66), "q8_0": (32, 34)}
 
 
-def bench_us(fn):
-    """Median time of one CUDA-graph replay; `do_bench` flushes L2 before each."""
+def bench_us(fn, captures=3):
+    """Time of one CUDA-graph replay; `do_bench` flushes L2 before each.
+
+    The best of a few captures' medians: separate captures of the same small
+    kernel can differ by 15-25% (seen on an RTX 5060 Ti).
+    """
     fn()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        fn()
-    return triton.testing.do_bench(graph.replay, return_mode="median") * 1e3
+    times = []
+    for _ in range(captures):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fn()
+        times.append(triton.testing.do_bench(graph.replay, return_mode="median"))
+    return min(times) * 1e3
 
 
 def random_blocks(lead, k, codec):

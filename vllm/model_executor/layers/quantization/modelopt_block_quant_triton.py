@@ -141,8 +141,11 @@ def _decode_tile(
     R: tl.constexpr = BK // 32
     rr = k0 // 32 + tl.arange(0, R)
     row = offs_n.to(tl.int64)[:, None]
-    if CODEC == 1:
-        # Per record: scale. Per group of 8: grid index and sign mask.
+    if CODEC == 1:  # IQ2_XXS
+        # Per 32 weights: a uint32 of four grid indices (8 weights each), then
+        # `aux` with four 7-bit sign indices and a 4-bit scale s on top. The
+        # sign byte is the index plus an even-parity bit 7. Weight =
+        # d * (0.5 + s) / 4 * grid magnitude * sign, as in ggml.
         d = tl.load(
             sc_ptr + row * stride_sn + (rr // 8)[None, :],
             mask=n_mask[:, None],
@@ -175,7 +178,7 @@ def _decode_tile(
         neg = (smask[:, :, :, None] >> j) & 1
         w = tl.where(neg != 0, -mag, mag) * rs[:, :, None, None]
         w = tl.reshape(w, (BN, BK))
-    else:
+    else:  # Q8_0: int8 times one fp16 scale per 32 weights
         d = tl.load(
             sc_ptr + row * stride_sn + rr[None, :], mask=n_mask[:, None], other=0.0
         ).to(tl.float32)
@@ -206,7 +209,11 @@ def _linear_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
-    """out[pid_k] = x[:, split] @ W[:, split]^T; out is [SPLIT, M, N]."""
+    """out[pid_k] = x[:, split] @ W[:, split]^T; out is [SPLIT, M, N].
+
+    BM < 16 multiplies on CUDA cores, decoding each weight tile once for all BM
+    rows; BM >= 16 uses `tl.dot`.
+    """
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
     if BM < 16:
@@ -291,9 +298,8 @@ def _moe_gemv_kernel(
 ):
     """One routed row per program: c[slot] = a[slot // top_k] @ W[e]^T.
 
-    For decode, when there are fewer routed rows than experts: no tensor cores,
-    so no rows are decoded that nobody asked for, and the LUT gather decode
-    beats the 2-bit codes used by the grouped GEMM's `tl.dot` layout.
+    For decode: each program decodes only the weights its row needs, with no
+    padded tensor-core tile, and uses the faster LUT gather decode.
     """
     slot = tl.program_id(0)
     if DIRECT_ROUTING:
@@ -317,7 +323,7 @@ def _moe_gemv_kernel(
         weight = tl.load(topk_weights_ptr + offs_token, mask=valid, other=0.0)
         acc *= weight.to(tl.float32)
     if APPLY_RELU2:
-        # Preserve the intermediate stored by the unfused first GEMM.
+        # Round first, as the unfused path stores GEMM1's output before relu2.
         value = tl.maximum(acc.to(c_ptr.dtype.element_ty).to(tl.float32), 0.0)
         acc = value * value
     tl.store(
@@ -333,6 +339,7 @@ def _block_matvec(
     CODEC: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     ROUND_WEIGHT: tl.constexpr = False,
 ):  # fmt: skip
+    """fp32 a[:K] @ W[offs_n, :K]^T; ROUND_WEIGHT rounds W to a's dtype first."""
     acc = tl.zeros((BN,), dtype=tl.float32)
     for k0 in range(0, K, BK):
         w = _decode_tile(
@@ -349,13 +356,19 @@ def _block_matvec(
 def _linear_config(
     M: int, N: int, K: int, codec: str, num_sms: int, smem: int, major: int
 ) -> dict[str, int]:
+    """Tile, split-K and launch config for `_linear_kernel`.
+
+    `smem` is the opt-in shared memory per block and `major` the compute
+    capability major of the device.
+    """
     if (
         major == 9
         and codec == "q8_0"
         and M == 1
         and (N, K) in ((256, 4096), (1024, 4096), (4096, 4096), (4096, 1024))
     ):
-        # Hopper decode: wider K tiles avoid a separate split-K reduction.
+        # Hopper decode on these shapes: one wide-K GEMV without split-K
+        # measured 1.5-2.5x faster on H200 than the generic path below.
         return {
             "BM": 1,
             "BN": 4,
@@ -424,8 +437,7 @@ def launch_linear(
         else torch.empty((split, M, N), dtype=torch.float32, device=x.device)
     )
     launch = {"num_warps": cfg["num_warps"], "num_stages": cfg["num_stages"]}
-    if cfg["BM"] < 16:
-        assert cfg["BM"] >= M
+    assert cfg["BM"] >= 16 or cfg["BM"] >= M, "a GEMV tile must hold all rows"
     grid = (triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"]), split)
     _linear_kernel[grid](
         x, qweight, scales, lut, out, M, N, K // split, x.stride(0),
@@ -608,12 +620,11 @@ def invoke_block_moe_gemv_kernel(
     codec: str,
     apply_relu2: bool = False,
 ) -> None:
-    """`invoke_block_moe_kernel` for one routed row per program.
+    """`invoke_block_moe_kernel` with one program per routed row.
 
-    Same arguments, except that `sorted_token_ids` / `expert_ids` come from
-    `moe_align_block_size` with `block_size=1`: one entry per routed row and no
-    padding, so `num_tokens_post_padded` is not needed (the grid is one program
-    per row and padding rows store nothing).
+    Routing is `moe_align_block_size` output for `block_size=1`, whose padding
+    rows store nothing, or, with `sorted_token_ids=None`, `topk_ids` itself as
+    `expert_ids` (slot i is routed row i). `num_tokens_post_padded` is unused.
     """
     N = qweight.size(1)
     slots = expert_ids.numel() if sorted_token_ids is None else expert_ids.size(0)
@@ -686,15 +697,16 @@ def invoke_block_moe_kernel(
         c: [..., N] in a's dtype, written at row `slot` of its flattened
             leading dims.
         topk_weights: [M, top_k] router weights.
-        sorted_token_ids: from `moe_align_block_size`.
-        expert_ids: from `moe_align_block_size`.
-        num_tokens_post_padded: from `moe_align_block_size`.
+        sorted_token_ids: from `_prepare_expert_assignment`.
+        expert_ids: from `_prepare_expert_assignment`.
+        num_tokens_post_padded: from `_prepare_expert_assignment`.
         mul_routed_weight: scale each row by its router weight.
         top_k: rows of `a` are repeated top_k times.
-        config: from `moe_config`, the one passed to `moe_align_block_size`.
+        config: from `moe_config`, as passed to `_prepare_expert_assignment`.
         codec: "iq2_xxs" or "q8_0".
 
     """
+    # Imported here: fused_moe imports this module for the decode helpers.
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         invoke_fused_moe_triton_kernel,
     )
