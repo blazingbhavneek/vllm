@@ -6,6 +6,11 @@ import functools
 
 import torch
 
+from vllm import envs
+from vllm.model_executor.determinism.batch_invariant import _fixed_order_sum_kernel
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_embedding import (  # noqa: E501
+    _dequant_gather_kernel,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -184,7 +189,7 @@ def _decode_tile(
 
 
 @triton.jit(do_not_specialize=["M"])
-def _gemm_kernel(
+def _linear_kernel(
     x_ptr,
     qw_ptr,
     sc_ptr,
@@ -204,54 +209,13 @@ def _gemm_kernel(
     """out[pid_k] = x[:, split] @ W[:, split]^T; out is [SPLIT, M, N]."""
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
-    num_n = tl.cdiv(N, BN)
-    offs_m = (pid // num_n) * BM + tl.arange(0, BM)
-    offs_n = (pid % num_n) * BN + tl.arange(0, BN)
-    m_mask = offs_m < M
-    n_mask = offs_n < N
-    x_rows = x_ptr + offs_m.to(tl.int64)[:, None] * stride_xm
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k0 in range(pid_k * k_per_split, (pid_k + 1) * k_per_split, BK):
-        x = tl.load(
-            x_rows + (k0 + tl.arange(0, BK))[None, :], mask=m_mask[:, None], other=0.0
-        )
-        w = _decode_tile(
-            qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
-            CODEC, False, BN, BK,
-        )  # fmt: skip
-        acc += tl.dot(x, tl.trans(w.to(x.dtype)))
-    out = (pid_k * M + offs_m.to(tl.int64))[:, None] * N + offs_n[None, :]
-    tl.store(
-        out_ptr + out,
-        acc.to(out_ptr.dtype.element_ty),
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
-
-
-@triton.jit(do_not_specialize=["M"])
-def _gemv_kernel(
-    x_ptr,
-    qw_ptr,
-    sc_ptr,
-    lut_ptr,
-    out_ptr,
-    M,
-    N,
-    k_per_split,
-    stride_xm,
-    stride_qn,
-    stride_sn,
-    CODEC: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """Small M without tensor cores, decoding each tile once for all BM rows:
-    out[pid_k] = x[:, split] @ W[:, split]^T; out is [SPLIT, M, N]."""
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    offs_m = tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
+    if BM < 16:
+        offs_m = tl.arange(0, BM)
+        offs_n = pid * BN + tl.arange(0, BN)
+    else:
+        num_n = tl.cdiv(N, BN)
+        offs_m = (pid // num_n) * BM + tl.arange(0, BM)
+        offs_n = (pid % num_n) * BN + tl.arange(0, BN)
     m_mask = offs_m < M
     n_mask = offs_n < N
     x_rows = x_ptr + offs_m.to(tl.int64)[:, None] * stride_xm
@@ -259,9 +223,9 @@ def _gemv_kernel(
     for k0 in range(pid_k * k_per_split, (pid_k + 1) * k_per_split, BK):
         w = _decode_tile(
             qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
-            CODEC, True, BN, BK,
+            CODEC, BM < 16, BN, BK,
         )  # fmt: skip
-        if BM == 1:  # the 3-D form below is ~35% slower for one row
+        if BM == 1:
             x = tl.load(x_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
             acc += tl.sum(w * x[None, :], axis=1)[None, :]
         else:
@@ -269,8 +233,11 @@ def _gemv_kernel(
                 x_rows + (k0 + tl.arange(0, BK))[None, :],
                 mask=m_mask[:, None],
                 other=0.0,
-            ).to(tl.float32)
-            acc += tl.sum(w[None, :, :] * x[:, None, :], axis=2)
+            )
+            if BM < 16:
+                acc += tl.sum(w[None, :, :] * x.to(tl.float32)[:, None, :], axis=2)
+            else:
+                acc += tl.dot(x, tl.trans(w.to(x.dtype)))
     out = (pid_k * M + offs_m.to(tl.int64))[:, None] * N + offs_n[None, :]
     tl.store(
         out_ptr + out,
@@ -293,108 +260,6 @@ def _dequant_kernel(
     )  # fmt: skip
     out = offs_n.to(tl.int64)[:, None] * K + (k0 + tl.arange(0, BK))[None, :]
     tl.store(out_ptr + out, w.to(out_ptr.dtype.element_ty), mask=n_mask[:, None])
-
-
-@triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
-def _moe_gemm_kernel(
-    a_ptr,
-    qw_ptr,
-    sc_ptr,
-    lut_ptr,
-    c_ptr,
-    topk_weights_ptr,
-    sorted_token_ids_ptr,
-    expert_ids_ptr,
-    num_tokens_post_padded_ptr,
-    N,
-    K,
-    EM,
-    num_valid_tokens,
-    stride_am,
-    stride_qe,
-    stride_qn,
-    stride_se,
-    stride_sn,
-    stride_cm,
-    top_k: tl.constexpr,
-    MUL_ROUTED_WEIGHT: tl.constexpr,
-    CODEC: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-):
-    """`fused_moe_kernel` with B decoded from packed blocks of expert e."""
-    pid = tl.program_id(0)
-    num_n = tl.cdiv(N, BN)
-    pid_m = pid // num_n
-    if pid_m * BM >= tl.load(num_tokens_post_padded_ptr):
-        return
-    offs_token = tl.load(sorted_token_ids_ptr + pid_m * BM + tl.arange(0, BM))
-    offs_token = offs_token.to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
-    e = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    offs_n = (pid % num_n) * BN + tl.arange(0, BN)
-    n_mask = offs_n < N
-    a_rows = a_ptr + (offs_token // top_k)[:, None] * stride_am
-    qw_ptr += e * stride_qe
-    sc_ptr += e * stride_se
-    if tl.constexpr(BM == 64 and BN == 32 and BK == 128):
-        # Sparse expert tiles avoid multiplying 63 padding rows by decoded weights.
-        first = tl.load(sorted_token_ids_ptr + pid_m * BM).to(tl.int64)
-        second = tl.load(sorted_token_ids_ptr + pid_m * BM + 1)
-        if second >= num_valid_tokens:
-            row = a_ptr + (first // top_k) * stride_am
-            single = tl.zeros((BN,), dtype=tl.float32)
-            for k0 in range(0, K, BK):
-                # Match the tensor-core path's weight rounding.
-                single_w = (
-                    _decode_tile(
-                        qw_ptr,
-                        sc_ptr,
-                        lut_ptr,
-                        offs_n,
-                        n_mask,
-                        k0,
-                        stride_qn,
-                        stride_sn,
-                        CODEC,
-                        True,
-                        BN,
-                        BK,
-                    )
-                    .to(a_ptr.dtype.element_ty)
-                    .to(tl.float32)
-                )
-                single_x = tl.load(row + k0 + tl.arange(0, BK)).to(tl.float32)
-                single += tl.sum(single_w * single_x[None, :], axis=1)
-            if MUL_ROUTED_WEIGHT:
-                single *= tl.load(topk_weights_ptr + first).to(tl.float32)
-            tl.store(
-                c_ptr + first * stride_cm + offs_n,
-                single.to(c_ptr.dtype.element_ty),
-                n_mask,
-            )
-            return
-    acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        a = tl.load(
-            a_rows + (k0 + tl.arange(0, BK))[None, :],
-            mask=token_mask[:, None],
-            other=0.0,
-        )
-        w = _decode_tile(
-            qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
-            CODEC, False, BN, BK,
-        )  # fmt: skip
-        acc += tl.dot(a, tl.trans(w.to(a.dtype)))
-    if MUL_ROUTED_WEIGHT:
-        weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
-        acc *= weight.to(tl.float32)[:, None]
-    tl.store(
-        c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :],
-        acc.to(c_ptr.dtype.element_ty),
-        mask=token_mask[:, None] & n_mask[None, :],
-    )
 
 
 @triton.jit(do_not_specialize=["num_valid_tokens"])
@@ -428,7 +293,7 @@ def _moe_gemv_kernel(
 
     For decode, when there are fewer routed rows than experts: no tensor cores,
     so no rows are decoded that nobody asked for, and the LUT gather decode
-    beats the 2-bit codes used by `_moe_gemm_kernel`'s `tl.dot` layout.
+    beats the 2-bit codes used by the grouped GEMM's `tl.dot` layout.
     """
     slot = tl.program_id(0)
     if DIRECT_ROUTING:
@@ -444,14 +309,10 @@ def _moe_gemv_kernel(
     a_row = a_ptr + row * stride_am
     qw_ptr += e * stride_qe
     sc_ptr += e * stride_se
-    acc = tl.zeros((BN,), dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        w = _decode_tile(
-            qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
-            CODEC, True, BN, BK,
-        )  # fmt: skip
-        x = tl.load(a_row + k0 + tl.arange(0, BK)).to(tl.float32)
-        acc += tl.sum(w * x[None, :], axis=1)
+    acc = _block_matvec(
+        a_row, qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, K,
+        stride_qn, stride_sn, CODEC, BN, BK,
+    )  # fmt: skip
     if MUL_ROUTED_WEIGHT:
         weight = tl.load(topk_weights_ptr + offs_token, mask=valid, other=0.0)
         acc *= weight.to(tl.float32)
@@ -466,33 +327,23 @@ def _moe_gemv_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["total", "split"])
-def _splitk_reduce_kernel(p_ptr, out_ptr, total, split, BN: tl.constexpr):
-    """Sum the split-K partials: p [split, total] fp32 -> [total] in out's dtype."""
-    offs = tl.program_id(0) * BN + tl.arange(0, BN)
-    mask = offs < total
-    acc = tl.load(p_ptr + offs, mask=mask, other=0.0)
-    for s in range(1, split):
-        acc += tl.load(p_ptr + s * total + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-
-
 @triton.jit
-def _q8_embedding_kernel(
-    ids_ptr, qw_ptr, sc_ptr, out_ptr, H, stride_qn, stride_sn, stride_om,
-    BH: tl.constexpr,
+def _block_matvec(
+    a_ptr, qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, K, stride_qn, stride_sn,
+    CODEC: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    ROUND_WEIGHT: tl.constexpr = False,
 ):  # fmt: skip
-    t = tl.program_id(0)
-    offs = tl.program_id(1) * BH + tl.arange(0, BH)
-    mask = offs < H
-    row = tl.load(ids_ptr + t).to(tl.int64)
-    q = tl.load(qw_ptr + row * stride_qn + offs, mask=mask).to(tl.float32)
-    d = tl.load(sc_ptr + row * stride_sn + offs // 32, mask=mask).to(tl.float32)
-    tl.store(
-        out_ptr + t.to(tl.int64) * stride_om + offs,
-        (q * d).to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        w = _decode_tile(
+            qw_ptr, sc_ptr, lut_ptr, offs_n, n_mask, k0, stride_qn, stride_sn,
+            CODEC, True, BN, BK,
+        )  # fmt: skip
+        if ROUND_WEIGHT:
+            w = w.to(a_ptr.dtype.element_ty).to(tl.float32)
+        x = tl.load(a_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    return acc
 
 
 def _linear_config(
@@ -573,26 +424,21 @@ def launch_linear(
         else torch.empty((split, M, N), dtype=torch.float32, device=x.device)
     )
     launch = {"num_warps": cfg["num_warps"], "num_stages": cfg["num_stages"]}
-    if cfg["BM"] < 16:  # tl.dot needs BM >= 16
+    if cfg["BM"] < 16:
         assert cfg["BM"] >= M
-        _gemv_kernel[(triton.cdiv(N, cfg["BN"]), split)](
-            x, qweight, scales, lut, out, M, N, K // split, x.stride(0),
-            qweight.stride(0), scales.stride(0), CODEC=_CODEC_ID[codec],
-            BM=cfg["BM"], BN=cfg["BN"], BK=cfg["BK"], **launch,
-        )  # fmt: skip
-    else:
-        grid = (triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"]), split)
-        _gemm_kernel[grid](
-            x, qweight, scales, lut, out, M, N, K // split, x.stride(0),
-            qweight.stride(0), scales.stride(0), CODEC=_CODEC_ID[codec],
-            BM=cfg["BM"], BN=cfg["BN"], BK=cfg["BK"], **launch,
-        )  # fmt: skip
+    grid = (triton.cdiv(M, cfg["BM"]) * triton.cdiv(N, cfg["BN"]), split)
+    _linear_kernel[grid](
+        x, qweight, scales, lut, out, M, N, K // split, x.stride(0),
+        qweight.stride(0), scales.stride(0), CODEC=_CODEC_ID[codec],
+        BM=cfg["BM"], BN=cfg["BN"], BK=cfg["BK"], **launch,
+    )  # fmt: skip
     if split == 1:
         return out
     y = x.new_empty((M, N))
     total = M * N
-    _splitk_reduce_kernel[(triton.cdiv(total, 1024),)](
-        out, y, total, split, BN=1024, num_warps=4
+    _fixed_order_sum_kernel[(triton.cdiv(total, 1024),)](
+        out, y, total, total, WORLD_SIZE=split, BLOCK_SIZE=1024,
+        LARGE=split * total >= 2**31, num_warps=4,
     )  # fmt: skip
     return y
 
@@ -647,7 +493,6 @@ def _modelopt_block_linear(
     scales: torch.Tensor,
     lut: torch.Tensor | None,
     codec: str,
-    weight_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed block GEMM; picks the kernel from M inside the op.
 
@@ -657,7 +502,6 @@ def _modelopt_block_linear(
         scales: fp16 [N, K / block_size].
         lut: `iq2_lut` for IQ2_XXS, None for Q8_0.
         codec: "iq2_xxs" or "q8_0".
-        weight_bf16: Optional cached dequantized weights for the BF16 GEMM path.
 
     Returns:
         [M, N] in x's dtype.
@@ -666,21 +510,17 @@ def _modelopt_block_linear(
     M, K = x.shape
     if M == 0:
         return x.new_empty((0, qweight.shape[0]))
-    if (
-        dequant_min_m(codec, x.device.index) <= M
-        and qweight.shape[0] * K <= DEQUANT_MAX_NUMEL
+    invariant = envs.VLLM_BATCH_INVARIANT
+    if qweight.shape[0] * K <= DEQUANT_MAX_NUMEL and (
+        invariant or dequant_min_m(codec, x.device.index) <= M
     ):
-        weight = (
-            weight_bf16
-            if weight_bf16 is not None
-            else dequantize_blocks(qweight, scales, lut, codec, x.dtype)
-        )
-        return x @ weight.T
+        # Batch-invariant mode makes this matmul invariant as well.
+        return x @ dequantize_blocks(qweight, scales, lut, codec, x.dtype).T
     if x.stride(1) != 1:
         x = x.contiguous()
     props = torch.cuda.get_device_properties(x.device)
     cfg = _linear_config(
-        M,
+        32 if invariant else M,
         qweight.shape[0],
         K,
         codec,
@@ -688,6 +528,9 @@ def _modelopt_block_linear(
         props.shared_memory_per_block_optin,
         props.major,
     )
+    if invariant:
+        # One tile shape for every M and no split-K: each row's sum is fixed.
+        cfg["SPLIT"] = 1
     return launch_linear(x, qweight, scales, lut, codec, cfg)
 
 
@@ -697,7 +540,6 @@ def _modelopt_block_linear_fake(
     scales: torch.Tensor,
     lut: torch.Tensor | None,
     codec: str,
-    weight_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], qweight.shape[0]))
 
@@ -710,9 +552,10 @@ def _modelopt_block_embedding(
         (ids.numel(), qweight.shape[1]), dtype=dtype, device=qweight.device
     )
     if ids.numel():
-        _q8_embedding_kernel[(ids.numel(), triton.cdiv(out.shape[1], 1024))](
+        _dequant_gather_kernel[(ids.numel(), triton.cdiv(out.shape[1], 1024))](
             ids, qweight, scales, out, out.shape[1], qweight.stride(0),
-            scales.stride(0), out.stride(0), BH=1024,
+            scales.stride(0), NUM_BITS=8, PACK_FACTOR=1, GROUP_SIZE=32,
+            BLOCK=1024, UNPACKED_INT8=True,
         )  # fmt: skip
     return out
 
@@ -743,7 +586,7 @@ def moe_gemv_config(M: int, E: int, top_k: int, codec: str) -> dict[str, int] | 
     both HBM and GDDR GPUs, `moe_config`'s padded `tl.dot` tiles win above 8
     rows, even though a standalone kernel sweep keeps the GEMV ahead longer.
     """
-    if M > 8:
+    if M > 8 or envs.VLLM_BATCH_INVARIANT:
         return None
     bn, bk, warps = (8, 256, 1) if codec == "iq2_xxs" else (32, 256, 4)
     return {"BN": bn, "BK": bk, "num_warps": warps, "num_stages": 2}
@@ -788,9 +631,14 @@ def invoke_block_moe_gemv_kernel(
 
 def moe_config(M: int, E: int, top_k: int) -> dict[str, int]:
     """Tile sizes for `invoke_block_moe_kernel`, from tokens per expert."""
+    if envs.VLLM_BATCH_INVARIANT:
+        from vllm.model_executor.layers.fused_moe.fused_moe import get_default_config
+
+        return get_default_config(M, E, 0, 0, top_k, None)
     per_expert = M * top_k / E
     if per_expert < 1:
-        # Decode: widen N and deepen K instead of pipelining.
+        # Decode: widen N and deepen K instead of pipelining. fused_moe_kernel
+        # runs single-row tiles of exactly this shape as a GEMV.
         bm, bn, bk = 64, 32, 128
     elif per_expert < 64:
         bm, bn, bk = 64, 128, 64
@@ -805,8 +653,8 @@ def moe_config(M: int, E: int, top_k: int) -> dict[str, int]:
         bm, bn, bk, warps = min(bm, 64), 64, 32, 8
     return {
         "BLOCK_SIZE_M": bm,
-        "BN": bn,
-        "BK": bk,
+        "BLOCK_SIZE_N": bn,
+        "BLOCK_SIZE_K": bk,
         "num_warps": warps,
         "num_stages": 1,
     }
@@ -819,7 +667,7 @@ def invoke_block_moe_kernel(
     lut: torch.Tensor | None,
     c: torch.Tensor,
     topk_weights: torch.Tensor | None,
-    sorted_token_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
@@ -847,16 +695,15 @@ def invoke_block_moe_kernel(
         codec: "iq2_xxs" or "q8_0".
 
     """
-    bm = config["BLOCK_SIZE_M"]
-    em = sorted_token_ids.size(0)
-    if a.size(0) < bm:
-        em = min(em, a.size(0) * top_k * bm)
-    N = qweight.size(1)
-    _moe_gemm_kernel[(triton.cdiv(em, bm) * triton.cdiv(N, config["BN"]),)](
-        a, qweight, scales, lut, c, topk_weights, sorted_token_ids, expert_ids,
-        num_tokens_post_padded, N, a.size(1), em, a.size(0) * top_k, a.stride(0),
-        qweight.stride(0), qweight.stride(1), scales.stride(0), scales.stride(1),
-        c.stride(-2), top_k=top_k, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        CODEC=_CODEC_ID[codec], BM=bm, BN=config["BN"], BK=config["BK"],
-        num_warps=config["num_warps"], num_stages=config["num_stages"],
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        invoke_fused_moe_triton_kernel,
+    )
+
+    invoke_fused_moe_triton_kernel(
+        a, qweight, c, None, scales, topk_weights, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, mul_routed_weight, top_k,
+        {"GROUP_SIZE_M": 1, **config},
+        tl.bfloat16 if a.dtype == torch.bfloat16 else tl.float16,
+        False, False, False, False, False,
+        block_codec=_CODEC_ID[codec], B_lut=lut,
     )  # fmt: skip

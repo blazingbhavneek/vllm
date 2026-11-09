@@ -31,6 +31,10 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
+from vllm.model_executor.layers.quantization.modelopt_block_quant_triton import (
+    _block_matvec,
+    _decode_tile,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
@@ -294,7 +298,7 @@ def fused_moe_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -356,6 +360,8 @@ def fused_moe_kernel(
     USE_TMA_B: tl.constexpr = False,
     USE_TMA_A: tl.constexpr = False,
     C_IS_SORTED: tl.constexpr = False,
+    BLOCK_CODEC: tl.constexpr = -1,
+    b_lut_ptr=None,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -444,6 +450,49 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    if tl.constexpr(
+        BLOCK_CODEC >= 0
+        and BLOCK_SIZE_M == 64
+        and BLOCK_SIZE_N == 32
+        and BLOCK_SIZE_K == 128
+        and not HAS_BIAS
+    ):
+        # The block-codec decode tile (`moe_config`): a tile holding one routed
+        # row runs as a GEMV instead of a padded tensor-core tile.
+        if naive_block_assignment:
+            first = pid_m.to(tl.int64)
+            singleton = True
+        else:
+            first = tl.load(sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M).to(tl.int64)
+            singleton = (
+                tl.load(sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + 1)
+                >= num_valid_tokens
+            )
+        if singleton:
+            single_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            single = _block_matvec(
+                a_ptr + first // top_k * stride_am,
+                b_ptr + off_experts * stride_be,
+                b_scale_ptr + off_experts * stride_bse,
+                b_lut_ptr,
+                single_n,
+                single_n < N,
+                K,
+                stride_bn,
+                stride_bsn,
+                BLOCK_CODEC,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                ROUND_WEIGHT=True,  # as the tl.dot path does
+            )
+            if MUL_ROUTED_WEIGHT:
+                single *= tl.load(topk_weights_ptr + first).to(tl.float32)
+            tl.store(
+                c_ptr + first * stride_cm + single_n * stride_cn,
+                single.to(compute_type),
+                mask=single_n < N,
+            )
+            return
     # TD gather and the SWAP_AB accumulator layout are mutually exclusive.
     tl.static_assert(not (USE_TD and SWAP_AB))
     tl.static_assert(not (USE_TD and USE_TMA_B))
@@ -551,10 +600,29 @@ def fused_moe_kernel(
                 mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
-            if not USE_TMA_B:
+            if not USE_TMA_B and BLOCK_CODEC < 0:
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
+        if BLOCK_CODEC >= 0:
+            b = (
+                _decode_tile(
+                    b_ptr + off_experts * stride_be,
+                    b_scale_ptr + off_experts * stride_bse,
+                    b_lut_ptr,
+                    offs_bn,
+                    offs_bn < N,
+                    k * BLOCK_SIZE_K,
+                    stride_bn,
+                    stride_bsn,
+                    BLOCK_CODEC,
+                    False,
+                    BLOCK_SIZE_N,
+                    BLOCK_SIZE_K,
+                )
+                .to(compute_type)
+                .T
+            )
         if USE_TMA_B:
             b = b_desc.load(
                 [off_experts.to(tl.int32), pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]
@@ -815,12 +883,20 @@ def invoke_fused_moe_triton_kernel(
     B_bias: torch.Tensor | None = None,
     A_is_sorted: bool = False,
     C_is_sorted: bool = False,
+    block_codec: int = -1,
+    B_lut: torch.Tensor | None = None,
 ):
     assert topk_weights is not None or not mul_routed_weight
     if topk_weights is not None and not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
     assert not (A_is_sorted or C_is_sorted) or sorted_token_ids is not None
+
+    if block_codec >= 0:
+        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert block_shape is None
+        assert not (A_is_sorted or C_is_sorted)
+        assert A.size(1) % config["BLOCK_SIZE_K"] == 0
 
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -848,7 +924,7 @@ def invoke_fused_moe_triton_kernel(
         assert block_shape is None or triton.cdiv(
             B.size(-1), block_shape[1]
         ) == B_scale.size(-1)
-    elif use_int8_w8a16 or use_int4_w4a16:
+    elif use_int8_w8a16 or use_int4_w4a16 or block_codec >= 0:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
     else:
@@ -951,7 +1027,7 @@ def invoke_fused_moe_triton_kernel(
         num_tokens_post_padded,
         a_desc,
         B.size(1),
-        B.size(2),
+        A.size(1) if block_codec >= 0 else B.size(2),
         EM,
         num_tokens,
         A.stride(0),
@@ -987,6 +1063,8 @@ def invoke_fused_moe_triton_kernel(
         USE_TMA_B=use_tma_b,
         USE_TMA_A=use_tma_a,
         C_IS_SORTED=C_is_sorted,
+        BLOCK_CODEC=block_codec,
+        b_lut_ptr=B_lut,
         **config,
     )
 
