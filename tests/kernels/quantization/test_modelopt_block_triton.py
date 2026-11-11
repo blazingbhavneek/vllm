@@ -237,12 +237,16 @@ def test_shared_expert_error_does_not_pile_up(M):
     assert err <= 1.5 * (cublas.double() - exact).abs().max(), err
 
 
-@pytest.mark.parametrize("N,K", [(256, 4096), (1024, 4096), (4096, 4096), (4096, 1024)])
-def test_q8_single_row_hopper_shapes(N, K):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "N,K",
+    [(256, 4096), (1024, 4096), (2304, 4096), (4096, 4096), (4096, 1024), (4608, 4096)],
+)
+def test_q8_single_row_hopper_shapes(N, K, dtype):
     """Hopper runs these single-row Q8_0 shapes as one wide-K GEMV without
     split-K (`_linear_config`); it must keep cuBLAS-level error under replay."""
-    raw = make_raw((N,), K, "q8_0", seed=31, extreme=True)
-    x = torch.randn(1, K, device="cuda", dtype=torch.bfloat16)
+    raw = make_raw((N,), K, "q8_0", seed=31, extreme=dtype == torch.bfloat16)
+    x = torch.randn(1, K, device="cuda", dtype=dtype)
     want = ref_decode(raw, "q8_0")
     linear(x, raw, "q8_0")
     graph = torch.cuda.CUDAGraph()

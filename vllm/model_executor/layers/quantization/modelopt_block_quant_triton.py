@@ -365,14 +365,21 @@ def _linear_config(
         major == 9
         and codec == "q8_0"
         and M == 1
-        and (N, K) in ((256, 4096), (1024, 4096), (4096, 4096), (4096, 1024))
+        and (N, K)
+        in (
+            (256, 4096),
+            (1024, 4096),
+            (2304, 4096),
+            (4096, 4096),
+            (4096, 1024),
+            (4608, 4096),
+        )
     ):
-        # Hopper decode on these shapes: one wide-K GEMV without split-K
-        # measured 1.5-2.5x faster on H200 than the generic path below.
+        # Hopper decode favors a wide-K GEMV without split-K on these shapes.
         return {
             "BM": 1,
             "BN": 4,
-            "BK": min(K, 1024) if N == 4096 else K,
+            "BK": min(K, 1024) if N >= 2304 else K,
             "SPLIT": 1,
             "num_warps": 4,
             "num_stages": 1,

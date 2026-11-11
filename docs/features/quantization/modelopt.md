@@ -75,6 +75,8 @@ the checkpoint. The startup log shows
 - The Triton kernels run with BF16 or FP16 activations. b12x requires BF16, so
   `--dtype half` uses Triton on every GPU. Turing (SM75) has no BF16 support
   and runs FP16 only.
+- Q8_0 retains the checkpoint's FP16 block scales, including with BF16
+  activations, without rounding the scales to BF16 for an INT8 backend.
 - Force the Triton path with `--linear-backend triton --moe-backend triton`.
   This also works on SM120 and SM121.
 - Routed experts support tensor parallelism only, not expert parallelism.
